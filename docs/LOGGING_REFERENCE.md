@@ -9,6 +9,8 @@ Unified reference for evidence and decision logging in this planning repository.
   - `MAIN_PLAN.txt`
 - V1 execution contract:
   - `V1_APPROVAL_PLAN.txt`
+- V1.1 improvement contract:
+  - `docs/V1_1_OPERATIONAL_ACCURACY_PLAN.md`
 - Current state:
   - `docs/PROJECT_STATE.md`
 - Phase and task progression:
@@ -26,6 +28,8 @@ Unified reference for evidence and decision logging in this planning repository.
   - record in `docs/NEXT_CHAT_CONTEXT.md`
 - Rule/protocol change:
   - update corresponding rule file in `docs/`
+- V1.1 quality gap update:
+  - record in `docs/V1_1_GAP_REGISTER.md` and mirror impact in state/tracker files
 
 ## 3) Event types (logical taxonomy)
 

@@ -1,30 +1,40 @@
 # IMPLEMENTATION_ROADMAP_V1
 
-## Цель
-Практический план разработки рабочей программы после архитектурного каркаса.
+## Status snapshot (2026-03-17)
+- V1 delivery phases (`2 -> 6`) are completed.
+- Release baseline was published (commit `4c71788`, tag `v0.1.0`).
+- Active improvement track moved to V1.1:
+  - `docs/V1_1_OPERATIONAL_ACCURACY_PLAN.md`
+  - `docs/V1_1_GAP_REGISTER.md`
 
-## Phase 2 - Scanner Baseline
-- Реализовать сбор структуры файлов.
-- Добавить определение стеков по сигнатурам.
-- Добавить модель unknown/confidence.
-- Выдавать `FactModel` в JSON.
+## Historical V1 phase map
 
-## Phase 3 - Questionnaire Engine
-- Построить список вопросов из unknown.
-- Добавить лимит вопросов по профилю (`quick/balanced/strict`).
-- Собирать ответы в `PolicyModel`.
+### Phase 2 - Scanner Baseline
+- File tree scan.
+- Stack/environment/entrypoint/command extraction.
+- Unknown + confidence model.
 
-## Phase 4 - Generator Engine
-- Сопоставить Fact+Policy в 9 обязательных артефактов.
-- Записывать `OPERATING_PACK_MANIFEST`.
-- Обеспечить deterministic section ordering.
+### Phase 3 - Questionnaire Engine
+- Unknown-driven question list.
+- Question budget by profile (`quick/balanced/strict`).
+- Policy model generation from answers.
 
-## Phase 5 - Validator Engine
-- Проверки полноты mandatory sections.
-- Проверки consistency между артефактами.
-- Блокировка run при критичных ошибках.
+### Phase 4 - Generator Engine
+- Fact + Policy to operating-pack artifacts.
+- Manifest generation.
+- Deterministic section structure.
 
-## Phase 6 - Pilot + Hardening
-- Прогон на пилотных репозиториях.
-- Измерение времени и полноты.
-- Закрытие P0/P1 дефектов перед baseline release.
+### Phase 5 - Validator Engine
+- Completeness checks.
+- Consistency checks.
+- Operational applicability checks.
+- Severity-ranked report with blocking on critical issues.
+
+### Phase 6 - Pilot + Release
+- Full pilot matrix execution.
+- Release hardening.
+- Baseline publish.
+
+## Next track
+- Continue with V1.1 operational accuracy cycle.
+- Keep V2/V3 scope excluded until V1.1 acceptance is complete.
