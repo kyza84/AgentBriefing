@@ -26,6 +26,14 @@ class ValidatorEngine:
         "TASK_TRACKING_PROTOCOL.md": 2,
     }
 
+    _BLOCKING_MAJOR_ISSUES = {
+        "entrypoint_fallback_unconfirmed",
+        "ci_pipeline_map_missing",
+        "test_command_missing_without_unknown",
+        "operability_entrypoint_missing_without_unknown",
+        "operability_commands_missing_without_unknown",
+    }
+
     def validate(
         self,
         artifacts: dict[str, str],
@@ -41,6 +49,7 @@ class ValidatorEngine:
             "policy_rule_presence",
             "fact_policy_consistency",
             "operational_applicability",
+            "operational_fact_quality",
             "scanner_signal_health",
         ]
 
@@ -160,15 +169,24 @@ class ValidatorEngine:
             fact_model=fact_model,
             policy_model=policy_model,
         )
+        self._validate_operational_fact_quality(
+            issues=issues,
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
         self._validate_scanner_signals(issues=issues, fact_model=fact_model)
 
         has_critical = any(i.severity == Severity.CRITICAL for i in issues)
+        has_blocking_major = any(
+            i.severity == Severity.MAJOR and i.issue_id in self._BLOCKING_MAJOR_ISSUES
+            for i in issues
+        )
         quality_score = self._quality_score(issues)
 
         return ValidationReport(
             checks_run=checks_run,
             issues=issues,
-            blocking_status=has_critical,
+            blocking_status=has_critical or has_blocking_major,
             quality_score=round(quality_score, 3),
             recommended_actions=self._recommended_actions(issues),
         )
@@ -303,6 +321,88 @@ class ValidatorEngine:
                 description="No key commands found and no tracked unknown for command resolution.",
                 remediation="Add canonical run/test commands or track u_commands_001 in questionnaire output.",
             )
+
+    def _validate_operational_fact_quality(
+        self,
+        issues: list[ValidationIssue],
+        fact_model: FactModel,
+        policy_model: PolicyModel,
+    ) -> None:
+        resolved_and_open = set(policy_model.resolved_unknowns) | set(policy_model.open_unknowns)
+
+        if fact_model.entry_points:
+            primary_entry = str(fact_model.entry_points[0]).strip().lower()
+            if self._is_fallback_entrypoint(primary_entry):
+                hypothesis_unknown_map = self._hypothesis_unknown_map(fact_model)
+                entrypoint_unknown = hypothesis_unknown_map.get("h_entrypoint_001", "")
+                is_confirmed = (
+                    "u_entrypoint_001" in policy_model.resolved_unknowns
+                    or (entrypoint_unknown and entrypoint_unknown in policy_model.resolved_unknowns)
+                )
+                is_tracked = (
+                    "u_entrypoint_001" in resolved_and_open
+                    or (entrypoint_unknown and entrypoint_unknown in resolved_and_open)
+                )
+                if not is_confirmed and not is_tracked:
+                    self._append_issue(
+                        issues=issues,
+                        issue_id="entrypoint_fallback_unconfirmed",
+                        severity=Severity.MAJOR,
+                        artifact="FACT_MODEL",
+                        description="Primary entrypoint is fallback/manual but confirmation tracking is missing.",
+                        remediation=(
+                            "Track fallback entrypoint as unknown/hypothesis or provide explicit confirmed entrypoint."
+                        ),
+                    )
+
+        ci_signaled = "github-actions" in fact_model.environments or "github-actions" in fact_model.external_integrations
+        if ci_signaled and not fact_model.ci_pipeline_map:
+            self._append_issue(
+                issues=issues,
+                issue_id="ci_pipeline_map_missing",
+                severity=Severity.MAJOR,
+                artifact="FACT_MODEL",
+                description="CI signal detected but ci_pipeline_map is empty.",
+                remediation="Extract workflow triggers/jobs into ci_pipeline_map before release.",
+            )
+
+        canonical_test_command = self._canonical_test_command(fact_model)
+        has_test_unknown = "u_tests_001" in resolved_and_open or "u_commands_001" in resolved_and_open
+        if not canonical_test_command and not has_test_unknown:
+            self._append_issue(
+                issues=issues,
+                issue_id="test_command_missing_without_unknown",
+                severity=Severity.MAJOR,
+                artifact="FACT_MODEL",
+                description="No canonical test command is established and no unknown tracks this gap.",
+                remediation="Define canonical test command in scanner/questionnaire or track explicit unknown.",
+            )
+
+    def _is_fallback_entrypoint(self, entrypoint: str) -> bool:
+        if "manual entrypoint reference" in entrypoint:
+            return True
+        return entrypoint.startswith(("readme.md", ".github/", "examples/", "example/", "tests/", "test/", "bench/"))
+
+    def _hypothesis_unknown_map(self, fact_model: FactModel) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        pending = [item for item in fact_model.hypotheses if item.requires_confirmation]
+        for idx, item in enumerate(pending, start=1):
+            mapping[item.hypothesis_id] = f"u_hypothesis_{idx:03d}"
+        return mapping
+
+    def _canonical_test_command(self, fact_model: FactModel) -> str:
+        for suite in fact_model.tests_map:
+            for command in suite.command_candidates:
+                if self._is_test_command(command):
+                    return command
+        for command in fact_model.key_commands:
+            if self._is_test_command(command):
+                return command
+        return ""
+
+    def _is_test_command(self, command: str) -> bool:
+        lower = command.strip().lower()
+        return any(token in lower for token in ("test", "pytest", "unittest", "go test", "cargo test", "vitest", "jest"))
 
     def _validate_scanner_signals(self, issues: list[ValidationIssue], fact_model: FactModel) -> None:
         if fact_model.confidence_overall < 0.25:

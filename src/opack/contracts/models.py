@@ -26,8 +26,62 @@ class ModuleFact:
 
 
 @dataclass
+class TestSuiteFact:
+    suite_id: str
+    path: str
+    framework: str
+    command_candidates: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+
+@dataclass
+class CiJobFact:
+    job_id: str
+    name: str
+    critical_steps: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CiPipelineFact:
+    provider: str
+    file: str
+    name: str
+    triggers: list[str] = field(default_factory=list)
+    jobs: list[CiJobFact] = field(default_factory=list)
+    critical_steps: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+
+
+@dataclass
+class CriticalFileFact:
+    path: str
+    reason: str
+    risk_level: str
+    confidence: float = 0.0
+
+
+@dataclass
+class ModuleDependencyFact:
+    source_module: str
+    target_module: str
+    signal_count: int = 0
+    confidence: float = 0.0
+
+
+@dataclass
+class HypothesisItem:
+    hypothesis_id: str
+    area: str
+    claim: str
+    confidence: float
+    evidence: list[str] = field(default_factory=list)
+    requires_confirmation: bool = False
+    suggested_question: str = ""
+
+
+@dataclass
 class FactModel:
-    schema_version: str = "fact.v1"
+    schema_version: str = "fact.v1.1"
     repo_id: str = ""
     scan_timestamp_utc: str = field(default_factory=utc_now)
     detected_stacks: list[str] = field(default_factory=list)
@@ -36,9 +90,15 @@ class FactModel:
     environments: list[str] = field(default_factory=list)
     key_commands: list[str] = field(default_factory=list)
     external_integrations: list[str] = field(default_factory=list)
+    tests_map: list[TestSuiteFact] = field(default_factory=list)
+    ci_pipeline_map: list[CiPipelineFact] = field(default_factory=list)
+    critical_files_map: list[CriticalFileFact] = field(default_factory=list)
+    module_dependency_map: list[ModuleDependencyFact] = field(default_factory=list)
+    hypotheses: list[HypothesisItem] = field(default_factory=list)
     unknowns: list[UnknownItem] = field(default_factory=list)
     confidence_overall: float = 0.0
     confidence_breakdown: dict[str, float] = field(default_factory=dict)
+    operational_confidence: dict[str, float] = field(default_factory=dict)
     scanner_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

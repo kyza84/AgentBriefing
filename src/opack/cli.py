@@ -30,20 +30,46 @@ def _collect_interactive_unknown_answers(
     merged_answers = dict(existing_answers)
     unknown_answers_raw = merged_answers.get("unknown_answers", {})
     unknown_answers = dict(unknown_answers_raw) if isinstance(unknown_answers_raw, dict) else {}
+    hypothesis_answers_raw = merged_answers.get("hypothesis_answers", {})
+    hypothesis_answers = dict(hypothesis_answers_raw) if isinstance(hypothesis_answers_raw, dict) else {}
 
     if questions:
         print("[ОПРОСНИК] Режим ввода ответов")
     for item in questions:
-        unknown_id = item["unknown_id"]
+        question_type = str(item.get("question_type", "unknown"))
+
+        if question_type == "hypothesis":
+            hypothesis_id = str(item.get("target_id", "")).strip()
+            if not hypothesis_id:
+                continue
+            if str(hypothesis_answers.get(hypothesis_id, "")).strip():
+                continue
+
+            print(f"\n[{item.get('impact_level', 'medium')}] {item.get('question', '')}")
+            proposed = str(item.get("proposed_claim", "")).strip()
+            if proposed:
+                print(f"hypothesis: {proposed}")
+            print(f"id: {hypothesis_id}")
+            print("Формат ответа: confirm | edit:<new_text> | reject[:reason]")
+            answer = input("> ").strip()
+            if answer:
+                hypothesis_answers[hypothesis_id] = answer
+            continue
+
+        unknown_id = str(item.get("unknown_id", "")).strip()
+        if not unknown_id:
+            continue
         if str(unknown_answers.get(unknown_id, "")).strip():
             continue
-        print(f"\n[{item['impact_level']}] {item['question']}")
+
+        print(f"\n[{item.get('impact_level', 'medium')}] {item.get('question', '')}")
         print(f"id: {unknown_id}")
         answer = input("> ").strip()
         if answer:
             unknown_answers[unknown_id] = answer
 
     merged_answers["unknown_answers"] = unknown_answers
+    merged_answers["hypothesis_answers"] = hypothesis_answers
     return merged_answers, fact_model
 
 
