@@ -23,6 +23,9 @@ IGNORE_DIR_NAMES = {
     ".venv",
     "venv",
     "out",
+    ".monitor",
+    "pilot_workspace",
+    "pilot_runs",
 }
 
 
@@ -78,15 +81,16 @@ class ScannerEngine:
     def _collect_files(self, repo: Path) -> tuple[list[Path], list[str]]:
         files: list[Path] = []
         warnings: list[str] = []
+        ignored_lower = {name.lower() for name in IGNORE_DIR_NAMES}
 
         def _onerror(exc: OSError) -> None:
             warnings.append(f"Walk warning: {exc}")
 
         for root, dirs, filenames in os.walk(repo, topdown=True, onerror=_onerror):
-            dirs[:] = [d for d in dirs if d not in IGNORE_DIR_NAMES]
+            dirs[:] = [d for d in dirs if d.lower() not in ignored_lower]
             for name in filenames:
                 path = Path(root) / name
-                if any(part in IGNORE_DIR_NAMES for part in path.parts):
+                if any(part.lower() in ignored_lower for part in path.parts):
                     continue
                 files.append(path)
         return files, warnings

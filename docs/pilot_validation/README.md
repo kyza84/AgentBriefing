@@ -9,3 +9,5 @@ Contents:
 - `PERSONAL_MONITOR_QUICKSTART.md` - one-click monitor usage guide
 - `PILOT_RESULTS_BATCH1_2026-03-17.md` - first executed batch (3 repos x 3 profiles)
 - `PILOT_RESULTS_FULL_2026-03-17.md` - full 12x3 acceptance matrix (36 runs)
+- `PILOT_RESULTS_PHASE5_2026-03-17.md` - targeted Phase 5 validator acceptance (9 runs)
+- `PILOT_RESULTS_RELEASE_PHASE6_2026-03-17.md` - final Phase 6 release acceptance matrix (36 runs)

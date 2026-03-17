@@ -1,8 +1,9 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
-from opack.contracts.models import FactModel, UnknownItem
+from opack.contracts.models import FactModel, PolicyModel, UnknownItem
 from opack.engines.questionnaire import QuestionnaireEngine
 from opack.engines.scanner import ScannerEngine
 from opack.engines.validator import ValidatorEngine
@@ -23,6 +24,9 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue(output_dir.exists())
             self.assertTrue((output_dir / "OPERATING_PACK_MANIFEST.json").exists())
             self.assertTrue((output_dir / "VALIDATION_REPORT.json").exists())
+            validation = json.loads((output_dir / "VALIDATION_REPORT.json").read_text(encoding="utf-8"))
+            self.assertFalse(validation["blocking_status"])
+            self.assertEqual(len(validation["issues"]), 0)
 
     def test_generator_phase4_rich_russian_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as out_tmp:
@@ -68,6 +72,27 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue(any("make test" == c for c in fact.key_commands))
             self.assertGreater(fact.confidence_overall, 0.0)
             self.assertTrue(any(u.unknown_id == "u_workflow_001" for u in fact.unknowns))
+
+    def test_scanner_ignores_service_workdirs_in_release_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+
+            monitor_dir = repo / ".monitor"
+            monitor_dir.mkdir(parents=True, exist_ok=True)
+            (monitor_dir / "package.json").write_text('{"name":"noise","scripts":{"test":"jest"}}', encoding="utf-8")
+            (monitor_dir / "index.js").write_text("console.log('noise')\n", encoding="utf-8")
+
+            pilot_dir = repo / "pilot_runs"
+            pilot_dir.mkdir(parents=True, exist_ok=True)
+            (pilot_dir / "go.mod").write_text("module noise\n\ngo 1.21\n", encoding="utf-8")
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(fact.detected_stacks, ["python"])
+            self.assertFalse(any("index.js" in entry for entry in fact.entry_points))
+            self.assertTrue(all(module.name not in {".monitor", "pilot_runs"} for module in fact.modules))
 
     def test_questionnaire_resolves_unknowns_from_answers(self) -> None:
         engine = QuestionnaireEngine()
@@ -154,6 +179,91 @@ class PipelineSmokeTest(unittest.TestCase):
             policy_model=policy_model,
         )
         self.assertFalse(any(issue.issue_id == "unknown_mismatch" for issue in report.issues))
+
+    def test_validator_phase5_detects_unknown_resolution_overlap(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_workflow_001",
+                    area="workflow",
+                    description="Workflow unknown",
+                    impact_level="high",
+                    suggested_question="Workflow boundary?",
+                )
+            ],
+        )
+        policy_model = PolicyModel(
+            decision_profile="balanced",
+            agent_behavior_rules=["Rule A"],
+            handoff_rules=["Rule B"],
+            context_update_rules=["Rule C"],
+            escalation_rules=["Rule D"],
+            task_tracking_rules=["Rule E"],
+            resolved_unknowns=["u_workflow_001"],
+            open_unknowns=["u_workflow_001"],
+            answer_confidence=1.0,
+        )
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts={
+                "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- python\n\n## S2\n- module\n\n## S3\n- main.py\n\n## S4\n- ext\n\n## S5\n- u_workflow_001\n",
+                "PROJECT_STATE.md": "# S\n\n## S1\n- u_workflow_001\n\n## S2\n- ok\n",
+                "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. main.py\n\n## S2\n- python -m unittest discover -s tests -v\n",
+                "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
+                "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
+                "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
+                "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
+                "VALIDATION_REPORT.json": "{}",
+            },
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("unknown_resolution_overlap", issue_ids)
+
+    def test_validator_phase5_detects_operability_gaps_without_unknowns(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_workflow_001",
+                    area="workflow",
+                    description="Workflow unknown",
+                    impact_level="high",
+                    suggested_question="Workflow boundary?",
+                )
+            ],
+            confidence_overall=0.8,
+        )
+        policy_model = PolicyModel(
+            decision_profile="balanced",
+            agent_behavior_rules=["Rule A"],
+            handoff_rules=["Rule B"],
+            context_update_rules=["Rule C"],
+            escalation_rules=["Rule D"],
+            task_tracking_rules=["Rule E"],
+            open_unknowns=["u_workflow_001"],
+            answer_confidence=0.5,
+        )
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts={
+                "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- UNKNOWN\n\n## S2\n- module\n\n## S3\n- none\n\n## S4\n- ext\n\n## S5\n- u_workflow_001\n",
+                "PROJECT_STATE.md": "# S\n\n## S1\n- u_workflow_001\n\n## S2\n- ok\n",
+                "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. start\n\n## S2\n- boundaries\n",
+                "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
+                "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
+                "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
+                "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
+                "VALIDATION_REPORT.json": "{}",
+            },
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("operability_entrypoint_missing_without_unknown", issue_ids)
+        self.assertIn("operability_commands_missing_without_unknown", issue_ids)
 
 
 if __name__ == "__main__":
