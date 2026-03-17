@@ -47,6 +47,7 @@ class CiPipelineFact:
     file: str
     name: str
     triggers: list[str] = field(default_factory=list)
+    trigger_filters: dict[str, list[str]] = field(default_factory=dict)
     jobs: list[CiJobFact] = field(default_factory=list)
     critical_steps: list[str] = field(default_factory=list)
     confidence: float = 0.0
@@ -99,6 +100,7 @@ class FactModel:
     confidence_overall: float = 0.0
     confidence_breakdown: dict[str, float] = field(default_factory=dict)
     operational_confidence: dict[str, float] = field(default_factory=dict)
+    scan_guardrails: dict[str, Any] = field(default_factory=dict)
     scanner_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:

@@ -2,8 +2,9 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
-from opack.contracts.models import FactModel, HypothesisItem, PolicyModel, UnknownItem
+from opack.contracts.models import CiPipelineFact, FactModel, HypothesisItem, PolicyModel, UnknownItem
 from opack.engines.questionnaire import QuestionnaireEngine
 from opack.engines.scanner import ScannerEngine
 from opack.engines.validator import ValidatorEngine
@@ -178,6 +179,70 @@ class PipelineSmokeTest(unittest.TestCase):
             triggers = set(fact.ci_pipeline_map[0].triggers)
             self.assertEqual(triggers, {"workflow_dispatch", "push"})
             self.assertFalse({"inputs", "description", "required", "branches"} & triggers)
+            self.assertIn("branches=main", fact.ci_pipeline_map[0].trigger_filters.get("push", []))
+
+    def test_scanner_ci_parses_inline_map_events_and_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (repo / ".github" / "workflows" / "ci.yml").write_text(
+                "name: Inline CI\n"
+                "on: {push: {branches: [main, release/*]}, pull_request: {types: [opened, synchronize]}, workflow_dispatch: {}}\n"
+                "jobs:\n"
+                "  build:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: python -m unittest discover -s tests -v\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(len(fact.ci_pipeline_map), 1)
+            pipeline = fact.ci_pipeline_map[0]
+            self.assertEqual(set(pipeline.triggers), {"push", "pull_request", "workflow_dispatch"})
+            self.assertIn("branches=main", pipeline.trigger_filters.get("push", []))
+            self.assertIn("branches=release/*", pipeline.trigger_filters.get("push", []))
+            self.assertIn("types=opened", pipeline.trigger_filters.get("pull_request", []))
+            self.assertIn("types=synchronize", pipeline.trigger_filters.get("pull_request", []))
+
+    def test_scanner_ci_parses_block_filters_and_critical_job_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (repo / ".github" / "workflows" / "ci.yml").write_text(
+                "name: Deploy CI\n"
+                "on:\n"
+                "  push:\n"
+                "    branches:\n"
+                "      - main\n"
+                "    paths:\n"
+                "      - src/**\n"
+                "  schedule:\n"
+                "    - cron: \"0 3 * * *\"\n"
+                "jobs:\n"
+                "  deploy_prod:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: ./deploy.sh\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(len(fact.ci_pipeline_map), 1)
+            pipeline = fact.ci_pipeline_map[0]
+            self.assertEqual(set(pipeline.triggers), {"push", "schedule"})
+            self.assertIn("branches=main", pipeline.trigger_filters.get("push", []))
+            self.assertIn("paths=src/**", pipeline.trigger_filters.get("push", []))
+            self.assertTrue(any(job.job_id == "deploy_prod" for job in pipeline.jobs))
+            deploy_job = next(job for job in pipeline.jobs if job.job_id == "deploy_prod")
+            self.assertTrue(any("run: ./deploy.sh" == step for step in deploy_job.critical_steps))
+            self.assertTrue(any("run: ./deploy.sh" == step for step in pipeline.critical_steps))
 
     def test_scanner_extracts_module_dependency_map(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -214,6 +279,150 @@ class PipelineSmokeTest(unittest.TestCase):
             edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
             self.assertIn(("services", "core"), edge_pairs)
             self.assertIn(("api", "services"), edge_pairs)
+
+    def test_scanner_dependency_map_python_package_root_submodules(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "src" / "myapp" / "core").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "myapp" / "services").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "myapp" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "core" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "services" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "core" / "utils.py").write_text("def ping():\n    return 'pong'\n", encoding="utf-8")
+            (repo / "src" / "myapp" / "services" / "runner.py").write_text(
+                "from myapp.core.utils import ping\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
+            self.assertIn(("services", "core"), edge_pairs)
+            self.assertFalse(any(source.endswith(".py") for source, _ in edge_pairs))
+
+    def test_scanner_dependency_map_ts_alias_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "package.json").write_text('{"name":"sample","scripts":{"test":"npm run test"}}\n', encoding="utf-8")
+            (repo / "tsconfig.json").write_text(
+                "{\n"
+                "  \"compilerOptions\": {\n"
+                "    \"baseUrl\": \".\",\n"
+                "    \"paths\": {\n"
+                "      \"@app/*\": [\"src/app/*\"],\n"
+                "      \"@core\": [\"src/core/index.ts\"]\n"
+                "    }\n"
+                "  }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            (repo / "src" / "app").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "core").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "app" / "runner.ts").write_text("import { ping } from '@core';\n", encoding="utf-8")
+            (repo / "src" / "core" / "index.ts").write_text("export const ping = () => 'ok';\n", encoding="utf-8")
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
+            self.assertIn(("app", "core"), edge_pairs)
+
+    def test_scanner_dependency_map_go_module_path_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "go.mod").write_text("module github.com/acme/sample\n\ngo 1.21\n", encoding="utf-8")
+            (repo / "cmd").mkdir(parents=True, exist_ok=True)
+            (repo / "internal" / "service").mkdir(parents=True, exist_ok=True)
+            (repo / "internal" / "service" / "service.go").write_text(
+                "package service\n\nfunc Ping() string { return \"ok\" }\n",
+                encoding="utf-8",
+            )
+            (repo / "cmd" / "main.go").write_text(
+                "package main\n\nimport \"github.com/acme/sample/internal/service\"\n\nfunc main() { _ = service.Ping() }\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
+            self.assertIn(("cmd", "internal"), edge_pairs)
+
+    def test_scanner_quick_guardrails_activate_on_ci_workflow_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            workflows = repo / ".github" / "workflows"
+            workflows.mkdir(parents=True, exist_ok=True)
+
+            for idx in range(45):
+                (workflows / f"ci_{idx:03d}.yml").write_text(
+                    "name: CI\n"
+                    "on: [push]\n"
+                    "jobs:\n"
+                    "  build:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - run: python -m unittest discover -s tests -v\n",
+                    encoding="utf-8",
+                )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="quick")
+
+            self.assertTrue(fact.scan_guardrails.get("activated"))
+            self.assertIn("ci_workflow_cap", fact.scan_guardrails.get("reasons", []))
+            self.assertLessEqual(len(fact.ci_pipeline_map), 35)
+            self.assertTrue(any(item.unknown_id == "u_scan_budget_001" for item in fact.unknowns))
+            self.assertTrue(any(item.hypothesis_id == "h_scan_budget_001" for item in fact.hypotheses))
+            self.assertTrue(any("Guardrail" in warning for warning in fact.scanner_warnings))
+
+    def test_scanner_quick_guardrails_skip_oversized_dependency_files(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "src" / "app").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "core").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "app" / "main.py").write_text("from core.big import payload\n", encoding="utf-8")
+            big_payload = "x = 'a'\\n" * 50000
+            (repo / "src" / "core" / "big.py").write_text(big_payload, encoding="utf-8")
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="quick")
+
+            self.assertTrue(fact.scan_guardrails.get("activated"))
+            self.assertIn("dependency_large_file_skip", fact.scan_guardrails.get("reasons", []))
+            self.assertTrue(any("oversized source file" in warning for warning in fact.scanner_warnings))
+            self.assertTrue(any(item.unknown_id == "u_scan_budget_001" for item in fact.unknowns))
+
+    def test_scanner_guardrail_time_budget_uses_stabilization_grace(self) -> None:
+        scanner = ScannerEngine()
+        guardrail_state = {
+            "time_budget_sec": 10.0,
+            "time_budget_grace_sec": 0.4,
+        }
+
+        with patch("opack.engines.scanner.time.perf_counter", return_value=10.39):
+            self.assertFalse(scanner._time_budget_exceeded(guardrail_state=guardrail_state, scan_started_at=0.0))
+        with patch("opack.engines.scanner.time.perf_counter", return_value=10.41):
+            self.assertTrue(scanner._time_budget_exceeded(guardrail_state=guardrail_state, scan_started_at=0.0))
+
+    def test_scanner_collect_files_is_sorted_for_repeatability(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "src").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "B.py").write_text("print('b')\n", encoding="utf-8")
+            (repo / "src" / "a.py").write_text("print('a')\n", encoding="utf-8")
+            (repo / "alpha.txt").write_text("alpha\n", encoding="utf-8")
+
+            scanner = ScannerEngine()
+            files, _warnings = scanner._collect_files(repo=repo)
+            rel_paths = [path.relative_to(repo).as_posix() for path in files]
+
+            self.assertEqual(rel_paths, sorted(rel_paths, key=str.lower))
 
     def test_questionnaire_resolves_unknowns_from_answers(self) -> None:
         engine = QuestionnaireEngine()
@@ -532,6 +741,37 @@ class PipelineSmokeTest(unittest.TestCase):
         self.assertIn("ci_pipeline_map_missing", issue_ids)
         self.assertTrue(report.blocking_status)
 
+    def test_validator_phase4_allows_ci_missing_map_when_guardrail_unknown_is_tracked(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["python -m unittest discover -s tests -v"],
+            environments=["github-actions"],
+            external_integrations=["github-actions"],
+            scan_guardrails={"activated": True, "reasons": ["time_budget_exceeded_before_ci_scan"]},
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_scan_budget_001",
+                    area="scanner",
+                    description="Guardrail active",
+                    impact_level="medium",
+                    suggested_question="Run balanced?",
+                )
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_scan_budget_001"])
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertNotIn("ci_pipeline_map_missing", issue_ids)
+        self.assertIn("ci_pipeline_map_sampled_due_guardrail", issue_ids)
+        self.assertFalse(report.blocking_status)
+
     def test_validator_phase4_detects_missing_test_command_without_unknown(self) -> None:
         fact_model = FactModel(
             repo_id="repo",
@@ -549,6 +789,118 @@ class PipelineSmokeTest(unittest.TestCase):
         issue_ids = {issue.issue_id for issue in report.issues}
         self.assertIn("test_command_missing_without_unknown", issue_ids)
         self.assertTrue(report.blocking_status)
+
+    def test_validator_phase4_warns_when_ci_pipeline_map_lacks_detail(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["python -m unittest discover -s tests -v"],
+            environments=["github-actions"],
+            external_integrations=["github-actions"],
+            ci_pipeline_map=[
+                CiPipelineFact(
+                    provider="github-actions",
+                    file=".github/workflows/ci.yml",
+                    name="CI",
+                )
+            ],
+        )
+        policy_model = self._validator_ready_policy()
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("ci_pipeline_map_triggers_missing", issue_ids)
+        self.assertIn("ci_pipeline_map_jobs_missing", issue_ids)
+        self.assertFalse(report.blocking_status)
+
+    def test_validator_phase4_warns_when_test_gap_is_only_tracked_unknown(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["make build"],
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_tests_001",
+                    area="testing",
+                    description="No canonical test command yet",
+                    impact_level="high",
+                    suggested_question="What test command should run?",
+                )
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_tests_001"])
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("test_command_gap_tracked_as_unknown", issue_ids)
+        self.assertNotIn("test_command_missing_without_unknown", issue_ids)
+        self.assertFalse(report.blocking_status)
+
+    def test_validator_phase4_warns_on_fallback_entrypoint_plus_open_test_gap(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["README.md (manual entrypoint reference)"],
+            key_commands=["make build"],
+            hypotheses=[
+                HypothesisItem(
+                    hypothesis_id="h_entrypoint_001",
+                    area="architecture",
+                    claim="Canonical entrypoint: README.md (manual entrypoint reference)",
+                    confidence=0.55,
+                    requires_confirmation=True,
+                    suggested_question="Confirm canonical entrypoint?",
+                )
+            ],
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_hypothesis_001",
+                    area="architecture",
+                    description="Entrypoint hypothesis is unresolved",
+                    impact_level="medium",
+                    suggested_question="Confirm entrypoint",
+                ),
+                UnknownItem(
+                    unknown_id="u_tests_001",
+                    area="testing",
+                    description="No canonical test command yet",
+                    impact_level="high",
+                    suggested_question="What test command should run?",
+                ),
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_hypothesis_001", "u_tests_001"])
+        artifacts = {
+            "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- python\n\n## S2\n- module\n\n## S3\n- fallback\n\n## S4\n- ext\n\n## S5\n- u_hypothesis_001\n",
+            "PROJECT_STATE.md": "# S\n\n## S1\n- u_hypothesis_001\n\n## S2\n- ok\n",
+            "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. README.md (manual entrypoint reference)\n\n## S2\n- make build\n",
+            "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
+            "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
+            "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
+            "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
+            "VALIDATION_REPORT.json": "{}",
+        }
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=artifacts,
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("entrypoint_fallback_with_open_test_gap", issue_ids)
+        self.assertNotIn("entrypoint_fallback_unconfirmed", issue_ids)
+        self.assertNotIn("test_command_missing_without_unknown", issue_ids)
+        self.assertFalse(report.blocking_status)
 
 
 if __name__ == "__main__":

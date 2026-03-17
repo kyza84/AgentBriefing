@@ -329,6 +329,10 @@ class ValidatorEngine:
         policy_model: PolicyModel,
     ) -> None:
         resolved_and_open = set(policy_model.resolved_unknowns) | set(policy_model.open_unknowns)
+        canonical_test_command = self._canonical_test_command(fact_model)
+        has_test_unknown = "u_tests_001" in resolved_and_open or "u_commands_001" in resolved_and_open
+
+        fallback_entrypoint_tracked_unresolved = False
 
         if fact_model.entry_points:
             primary_entry = str(fact_model.entry_points[0]).strip().lower()
@@ -343,6 +347,7 @@ class ValidatorEngine:
                     "u_entrypoint_001" in resolved_and_open
                     or (entrypoint_unknown and entrypoint_unknown in resolved_and_open)
                 )
+                fallback_entrypoint_tracked_unresolved = bool(is_tracked and not is_confirmed)
                 if not is_confirmed and not is_tracked:
                     self._append_issue(
                         issues=issues,
@@ -355,28 +360,86 @@ class ValidatorEngine:
                         ),
                     )
 
-        ci_signaled = "github-actions" in fact_model.environments or "github-actions" in fact_model.external_integrations
-        if ci_signaled and not fact_model.ci_pipeline_map:
+        if fallback_entrypoint_tracked_unresolved and not canonical_test_command and has_test_unknown:
             self._append_issue(
                 issues=issues,
-                issue_id="ci_pipeline_map_missing",
+                issue_id="entrypoint_fallback_with_open_test_gap",
                 severity=Severity.MAJOR,
                 artifact="FACT_MODEL",
-                description="CI signal detected but ci_pipeline_map is empty.",
-                remediation="Extract workflow triggers/jobs into ci_pipeline_map before release.",
+                description=(
+                    "Fallback entrypoint is still unresolved and canonical test command is also unresolved "
+                    "(tracked only via unknowns)."
+                ),
+                remediation=(
+                    "Confirm canonical entrypoint and test command together before relying on this operating-pack."
+                ),
             )
 
-        canonical_test_command = self._canonical_test_command(fact_model)
-        has_test_unknown = "u_tests_001" in resolved_and_open or "u_commands_001" in resolved_and_open
-        if not canonical_test_command and not has_test_unknown:
-            self._append_issue(
-                issues=issues,
-                issue_id="test_command_missing_without_unknown",
-                severity=Severity.MAJOR,
-                artifact="FACT_MODEL",
-                description="No canonical test command is established and no unknown tracks this gap.",
-                remediation="Define canonical test command in scanner/questionnaire or track explicit unknown.",
-            )
+        ci_signaled = "github-actions" in fact_model.environments or "github-actions" in fact_model.external_integrations
+        ci_guardrail_mode = bool(fact_model.scan_guardrails.get("activated")) or "u_scan_budget_001" in resolved_and_open
+        if ci_signaled and not fact_model.ci_pipeline_map:
+            if ci_guardrail_mode:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="ci_pipeline_map_sampled_due_guardrail",
+                    severity=Severity.MINOR,
+                    artifact="FACT_MODEL",
+                    description="CI map is empty because scan guardrails were activated for this profile.",
+                    remediation="Re-run with balanced/strict profile for complete CI pipeline extraction if release-critical.",
+                )
+            else:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="ci_pipeline_map_missing",
+                    severity=Severity.MAJOR,
+                    artifact="FACT_MODEL",
+                    description="CI signal detected but ci_pipeline_map is empty.",
+                    remediation="Extract workflow triggers/jobs into ci_pipeline_map before release.",
+                )
+
+        if fact_model.ci_pipeline_map:
+            has_trigger_detail = any(bool(pipeline.triggers) for pipeline in fact_model.ci_pipeline_map)
+            has_job_detail = any(bool(pipeline.jobs) for pipeline in fact_model.ci_pipeline_map)
+            if not has_trigger_detail:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="ci_pipeline_map_triggers_missing",
+                    severity=Severity.MAJOR,
+                    artifact="FACT_MODEL",
+                    description="CI pipeline map exists but contains no trigger details.",
+                    remediation="Improve workflow trigger extraction or confirm CI trigger scope manually.",
+                )
+            if not has_job_detail:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="ci_pipeline_map_jobs_missing",
+                    severity=Severity.MAJOR,
+                    artifact="FACT_MODEL",
+                    description="CI pipeline map exists but contains no job-level detail.",
+                    remediation="Extract CI jobs/critical steps or provide explicit manual CI mapping.",
+                )
+
+        if not canonical_test_command:
+            if has_test_unknown:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="test_command_gap_tracked_as_unknown",
+                    severity=Severity.MINOR,
+                    artifact="FACT_MODEL",
+                    description=(
+                        "Canonical test command is still unresolved and tracked only as an open/resolved unknown."
+                    ),
+                    remediation="Confirm one executable post-change test command before release-critical edits.",
+                )
+            else:
+                self._append_issue(
+                    issues=issues,
+                    issue_id="test_command_missing_without_unknown",
+                    severity=Severity.MAJOR,
+                    artifact="FACT_MODEL",
+                    description="No canonical test command is established and no unknown tracks this gap.",
+                    remediation="Define canonical test command in scanner/questionnaire or track explicit unknown.",
+                )
 
     def _is_fallback_entrypoint(self, entrypoint: str) -> bool:
         if "manual entrypoint reference" in entrypoint:
