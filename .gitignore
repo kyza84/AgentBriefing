@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime artifacts
+.monitor/
+out/
+pilot_runs/
+pilot_workspace/
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Internal operating-layer docs (private prompt/context workflow)
+docs/ACCOUNT_TRANSFER_PROMPT.md
+docs/CHAT_FIRST_MESSAGE.md
+docs/CONTEXT_UPDATE_RULES.md
+docs/MASTER_PLAN_TRACKER.md
+docs/MATRIX_PRESET_MANUAL.md
+docs/MATRIX_RUNTIME_TUNER.md
+docs/NEXT_CHAT_CONTEXT.md
+docs/OPERATOR_PATTERNS.md
+docs/PROJECT_STATE.md
+docs/SAFE_TUNING_AGENT_PROTOCOL.md

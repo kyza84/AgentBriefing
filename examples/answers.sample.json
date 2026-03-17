@@ -1,0 +1,22 @@
+{
+  "unknown_answers": {
+    "u_workflow_001": "Escalate before changing V1 scope or critical architecture constraints.",
+    "u_entrypoint_001": "python -m opack.cli build --repo . --output ./out --profile balanced",
+    "u_commands_001": "python -m unittest discover -s tests -v"
+  },
+  "agent_behavior_rules": [
+    "Start with diagnostics, then propose minimal changes."
+  ],
+  "handoff_rules": [
+    "Summarize completed/not completed/deviation/next."
+  ],
+  "context_update_rules": [
+    "Update PROJECT_STATE and NEXT_CHAT_CONTEXT after material decisions."
+  ],
+  "escalation_rules": [
+    "Escalate when repository boundaries or release criteria change."
+  ],
+  "task_tracking_rules": [
+    "Attach evidence path for each completed task."
+  ]
+}
