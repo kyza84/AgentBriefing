@@ -61,3 +61,18 @@
   - `pilot_runs/v12_b5_release_r2_20260317_210650_results.json`
   - `pilot_runs/v12_b5_repeat_r2_20260317_210650.json`
   - `pilot_runs/v12_b5_repeat_check_r2_20260317_210650.json`
+
+## Hot fix cycle (post-B5)
+- Status: completed (`2026-03-17`) with P1/P2/P3 fixes implemented.
+- Completed:
+  1. Dependency-map fix for Python relative imports in package-root layout (`services -> core`, no structural-root fallback).
+  2. Removed false-positive test operability inference without real test-file evidence.
+  3. Validator now checks visibility of all `open_unknowns`, not only the first unknown.
+  4. CI parser migrated to internal YAML-AST extraction (`on/jobs/steps`) with safe legacy fallback.
+- Residual known risk:
+  1. Parser is optimized for CI extraction, not full YAML specification compliance (anchors/aliases/custom tags can degrade to fallback behavior).
+- Evidence:
+  - `docs/V1_2_HOT_FIX_PLAN.md`
+  - `src/opack/engines/scanner.py`
+  - `src/opack/engines/validator.py`
+  - `tests/test_pipeline_smoke.py`

@@ -9,6 +9,12 @@ PROFILE_BUDGET = {
     "strict": 30,
 }
 
+PROFILE_MIN_QUESTIONS = {
+    "quick": 3,
+    "balanced": 5,
+    "strict": 7,
+}
+
 IMPACT_ORDER = {
     "critical": 0,
     "high": 1,
@@ -31,6 +37,7 @@ class QuestionnaireEngine:
         unknowns = self._prioritize_unknowns(fact_model.unknowns)
         hypotheses = self._prioritize_hypotheses(fact_model.hypotheses)
         budget = PROFILE_BUDGET.get(profile, PROFILE_BUDGET["balanced"])
+        min_questions = PROFILE_MIN_QUESTIONS.get(profile, PROFILE_MIN_QUESTIONS["balanced"])
 
         hypothesis_unknown_map = self._map_hypothesis_unknowns(fact_model)
         covered_unknown_ids = set(hypothesis_unknown_map.keys())
@@ -79,7 +86,14 @@ class QuestionnaireEngine:
             candidates.append((priority, question))
 
         selected = sorted(candidates, key=lambda item: item[0])[:budget]
-        return [question for _, question in selected]
+        questions = [question for _, question in selected]
+        floor_target = min(budget, min_questions)
+        if len(questions) < floor_target:
+            for question in self._build_floor_hypothesis_questions(fact_model=fact_model, existing_questions=questions):
+                if len(questions) >= floor_target:
+                    break
+                questions.append(question)
+        return questions
 
     def build_policy_model(
         self,
@@ -239,6 +253,177 @@ class QuestionnaireEngine:
         for idx, hypothesis in enumerate(pending, start=1):
             mapping[f"u_hypothesis_{idx:03d}"] = hypothesis.hypothesis_id
         return mapping
+
+    def _build_floor_hypothesis_questions(
+        self,
+        fact_model: FactModel,
+        existing_questions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        used_target_ids = {
+            str(item.get("target_id", "")).strip()
+            for item in existing_questions
+            if str(item.get("question_type", "")).strip().lower() == "hypothesis"
+        }
+        used_target_ids = {item for item in used_target_ids if item}
+
+        pool: list[tuple[str, str, str, str, str]] = []
+        if fact_model.entry_points:
+            entry = fact_model.entry_points[0]
+            pool.append(
+                (
+                    "h_floor_entrypoint_001",
+                    "architecture",
+                    "high",
+                    f"Подтвердите canonical entrypoint: {entry}",
+                    f"Canonical entrypoint: {entry}",
+                )
+            )
+
+        if fact_model.key_commands:
+            command = fact_model.key_commands[0]
+            pool.append(
+                (
+                    "h_floor_commands_001",
+                    "workflow",
+                    "high",
+                    f"Подтвердите главную команду проверки/запуска: {command}",
+                    f"Primary run/test command: {command}",
+                )
+            )
+
+        test_command = self._canonical_test_command(fact_model)
+        if test_command:
+            pool.append(
+                (
+                    "h_floor_tests_001",
+                    "testing",
+                    "high",
+                    f"Этот post-change тест обязателен после правок: {test_command}?",
+                    f"Post-change test command: {test_command}",
+                )
+            )
+
+        ci_signaled = bool(fact_model.ci_pipeline_map) or (
+            "github-actions" in fact_model.environments or "github-actions" in fact_model.external_integrations
+        )
+        if ci_signaled:
+            pool.append(
+                (
+                    "h_floor_ci_001",
+                    "delivery",
+                    "high",
+                    "Подтвердите, что перед merge нужно сверяться с CI/CD правилами этого репозитория.",
+                    "CI/CD guardrails are mandatory before merge/release edits.",
+                )
+            )
+
+        if fact_model.critical_files_map:
+            critical = fact_model.critical_files_map[0].path
+            pool.append(
+                (
+                    "h_floor_critical_001",
+                    "architecture",
+                    "medium",
+                    f"Файл `{critical}` считаем критичным и меняем только с явным обоснованием?",
+                    f"Critical file guard: {critical}",
+                )
+            )
+
+        if fact_model.module_dependency_map:
+            edge = fact_model.module_dependency_map[0]
+            pool.append(
+                (
+                    "h_floor_dependencies_001",
+                    "architecture",
+                    "medium",
+                    (
+                        f"Подтвердите зависимость модулей как риск-зону: "
+                        f"{edge.source_module} -> {edge.target_module}"
+                    ),
+                    f"Dependency risk edge: {edge.source_module} -> {edge.target_module}",
+                )
+            )
+
+        pool.extend(
+            [
+                (
+                    "h_floor_scope_001",
+                    "workflow",
+                    "high",
+                    "Подтвердите границы scope текущей итерации (без дополнительных фич).",
+                    "Scope is fixed for the current iteration.",
+                ),
+                (
+                    "h_floor_escalation_001",
+                    "workflow",
+                    "high",
+                    "Подтвердите правило эскалации перед рискованными/необратимыми изменениями.",
+                    "Escalate before risky or irreversible changes.",
+                ),
+                (
+                    "h_floor_handoff_001",
+                    "workflow",
+                    "medium",
+                    "Подтвердите обязательный handoff: completed / not completed / deviation / next.",
+                    "Handoff format is mandatory at the end of each iteration.",
+                ),
+                (
+                    "h_floor_context_001",
+                    "workflow",
+                    "medium",
+                    "Подтвердите, что PROJECT_STATE и MASTER_PLAN_TRACKER обновляются после материальных изменений.",
+                    "Core context files are updated after material changes.",
+                ),
+                (
+                    "h_floor_validation_001",
+                    "testing",
+                    "medium",
+                    "Подтвердите, что после изменений всегда выполняется хотя бы одна проверка.",
+                    "At least one post-change verification step is required.",
+                ),
+                (
+                    "h_floor_constraints_001",
+                    "workflow",
+                    "medium",
+                    "Подтвердите, что конфликтующие правила фиксируются и эскалируются, а не игнорируются.",
+                    "Conflicting rules must be surfaced and escalated.",
+                ),
+            ]
+        )
+
+        questions: list[dict[str, Any]] = []
+        for target_id, area, impact, question_text, claim in pool:
+            if target_id in used_target_ids:
+                continue
+            used_target_ids.add(target_id)
+            questions.append(
+                {
+                    "question_id": f"h::{target_id}",
+                    "question_type": "hypothesis",
+                    "target_id": target_id,
+                    "area": area,
+                    "impact_level": impact,
+                    "confidence": 0.0,
+                    "question": question_text,
+                    "proposed_claim": claim,
+                    "response_format": "confirm | edit:<new_text> | reject[:reason]",
+                }
+            )
+        return questions
+
+    def _canonical_test_command(self, fact_model: FactModel) -> str:
+        for suite in fact_model.tests_map:
+            for command in suite.command_candidates:
+                if self._is_test_like_command(command):
+                    return command.strip()
+        for command in fact_model.key_commands:
+            if self._is_test_like_command(command):
+                return command.strip()
+        return ""
+
+    def _is_test_like_command(self, command: str) -> bool:
+        lower = str(command or "").strip().lower()
+        return any(token in lower for token in ("test", "pytest", "unittest", "go test", "cargo test", "vitest", "jest"))
 
     def _normalize_unknown_answers(self, value: Any) -> dict[str, str]:
         if not isinstance(value, dict):

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from opack.contracts.models import CiPipelineFact, FactModel, HypothesisItem, PolicyModel, UnknownItem
+from opack.contracts.models import CiJobFact, CiPipelineFact, FactModel, HypothesisItem, PolicyModel, UnknownItem
 from opack.engines.questionnaire import QuestionnaireEngine
 from opack.engines.scanner import ScannerEngine
 from opack.engines.validator import ValidatorEngine
@@ -17,6 +17,13 @@ class PipelineSmokeTest(unittest.TestCase):
             repo = Path(repo_tmp)
             (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
             (repo / "README.md").write_text("# sample\n", encoding="utf-8")
+            (repo / "main.py").write_text("print('hello')\n", encoding="utf-8")
+            (repo / "tests").mkdir(parents=True, exist_ok=True)
+            (repo / "tests" / "test_sample.py").write_text(
+                "def test_ok():\n    assert True\n",
+                encoding="utf-8",
+            )
+            (repo / "Makefile").write_text("test:\n\tpython -m unittest discover -s tests -v\n", encoding="utf-8")
 
             pipeline = BuildPipeline()
             result = pipeline.run(repo_path=repo, output_path=Path(out_tmp), profile="balanced")
@@ -49,9 +56,62 @@ class PipelineSmokeTest(unittest.TestCase):
             first_message = (pack_dir / "FIRST_MESSAGE_INSTRUCTIONS.md").read_text(encoding="utf-8")
 
             self.assertIn("## Обнаруженные стеки", architecture)
-            self.assertIn("## Точки входа", architecture)
-            self.assertIn("## Открытые unknown", state)
-            self.assertIn("## Первый ответ агента", first_message)
+            self.assertIn("## Точки входа и команды запуска", architecture)
+            self.assertIn("## Открытые решения", architecture)
+            self.assertIn("## Неопределенности и риски", state)
+            self.assertIn("## Чеклист первого сообщения", first_message)
+
+    def test_generator_phase2_parity_contract_sections_present(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp, tempfile.TemporaryDirectory() as out_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "main.py").write_text("print('hello')\n", encoding="utf-8")
+            (repo / "tests").mkdir(parents=True, exist_ok=True)
+            (repo / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            (repo / "Makefile").write_text("test:\n\tpython -m unittest discover -s tests -v\n", encoding="utf-8")
+
+            pipeline = BuildPipeline()
+            result = pipeline.run(
+                repo_path=repo,
+                output_path=Path(out_tmp),
+                profile="balanced",
+                answers={"unknown_answers": {"u_workflow_001": "Scope changes only after escalation."}},
+            )
+            pack_dir = Path(result["output_dir"])
+
+            architecture = (pack_dir / "PROJECT_ARCHITECTURE.md").read_text(encoding="utf-8")
+            state = (pack_dir / "PROJECT_STATE.md").read_text(encoding="utf-8")
+            first_message = (pack_dir / "FIRST_MESSAGE_INSTRUCTIONS.md").read_text(encoding="utf-8")
+            handoff = (pack_dir / "HANDOFF_PROTOCOL.md").read_text(encoding="utf-8")
+            behavior = (pack_dir / "AGENT_BEHAVIOR_RULES.md").read_text(encoding="utf-8")
+            context_policy = (pack_dir / "CONTEXT_UPDATE_POLICY.md").read_text(encoding="utf-8")
+            tracking = (pack_dir / "TASK_TRACKING_PROTOCOL.md").read_text(encoding="utf-8")
+
+            self.assertIn("## Модули и границы", architecture)
+            self.assertIn("## Внешние интеграции и CI/CD", architecture)
+            self.assertIn("## Зависимости между модулями", architecture)
+            self.assertIn("## Критичные файлы", architecture)
+            self.assertIn("## Открытые решения", architecture)
+
+            self.assertIn("## Снимок прогона", state)
+            self.assertIn("## Операционная готовность", state)
+            self.assertIn("## Предупреждения сканера", state)
+
+            self.assertIn("## Порядок чтения контекста", first_message)
+            self.assertIn("## Что проверить после изменений", first_message)
+            self.assertIn("## Открытые решения перед рисковыми правками", first_message)
+
+            self.assertIn("## Обязательный шаблон handoff", handoff)
+            self.assertIn("## Что осталось открытым", handoff)
+
+            self.assertIn("## Конфликты и ограничения", behavior)
+            self.assertIn("## Открытые решения", behavior)
+
+            self.assertIn("## Обязательные файлы", context_policy)
+            self.assertIn("## Проверка перед push", context_policy)
+
+            self.assertIn("## Лимит и статусы активных задач", tracking)
+            self.assertIn("## Правила архивации", tracking)
 
     def test_scanner_phase2_baseline_extracts_core_signals(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -73,6 +133,39 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue(any("make test" == c for c in fact.key_commands))
             self.assertGreater(fact.confidence_overall, 0.0)
             self.assertTrue(any(u.unknown_id == "u_workflow_001" for u in fact.unknowns))
+
+    def test_scanner_ranking_demotes_docs_and_tests_entrypoints(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "src").mkdir(parents=True, exist_ok=True)
+            (repo / "docs_src").mkdir(parents=True, exist_ok=True)
+            (repo / "tests").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "main.py").write_text("print('src')\n", encoding="utf-8")
+            (repo / "docs_src" / "main.py").write_text("print('docs')\n", encoding="utf-8")
+            (repo / "tests" / "main.py").write_text("print('tests')\n", encoding="utf-8")
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertGreaterEqual(len(fact.entry_points), 3)
+            self.assertEqual(fact.entry_points[0], "src/main.py")
+            self.assertIn("docs_src/main.py", fact.entry_points)
+            self.assertIn("tests/main.py", fact.entry_points)
+
+    def test_scanner_rank_key_commands_demotes_release_like_commands(self) -> None:
+        scanner = ScannerEngine()
+        ranked = scanner._rank_key_commands(
+            [
+                "npm run publish:test",
+                "npm run test",
+                "npm run test:cov",
+                "npm run deploy",
+                "npm run docs",
+            ]
+        )
+        self.assertEqual(ranked[0], "npm run test")
+        self.assertGreater(ranked.index("npm run publish:test"), ranked.index("npm run test"))
 
     def test_scanner_ignores_service_workdirs_in_release_mode(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -148,6 +241,39 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertIn("h_tests_001", hypothesis_ids)
             self.assertIn("h_ci_001", hypothesis_ids)
             self.assertIn("operational_confidence", fact.confidence_breakdown)
+
+    def test_scanner_ci_keeps_prioritized_workflow_order_for_primary_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (repo / ".github" / "workflows" / "add-to-project.yml").write_text(
+                "name: Add to Project\n"
+                "on: [issues]\n"
+                "jobs:\n"
+                "  triage:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: echo triage\n",
+                encoding="utf-8",
+            )
+            (repo / ".github" / "workflows" / "test.yml").write_text(
+                "name: Test\n"
+                "on: [push, pull_request]\n"
+                "jobs:\n"
+                "  test:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: python -m unittest discover -s tests -v\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertGreaterEqual(len(fact.ci_pipeline_map), 2)
+            self.assertEqual(fact.ci_pipeline_map[0].file, ".github/workflows/test.yml")
+            self.assertEqual(fact.ci_pipeline_map[1].file, ".github/workflows/add-to-project.yml")
 
     def test_scanner_ci_triggers_ignore_nested_workflow_dispatch_fields(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -244,6 +370,68 @@ class PipelineSmokeTest(unittest.TestCase):
             self.assertTrue(any("run: ./deploy.sh" == step for step in deploy_job.critical_steps))
             self.assertTrue(any("run: ./deploy.sh" == step for step in pipeline.critical_steps))
 
+    def test_scanner_ci_ast_parses_block_scalar_run_command(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (repo / ".github" / "workflows" / "release.yml").write_text(
+                "name: Release Workflow\n"
+                "on:\n"
+                "  push:\n"
+                "    branches: [main]\n"
+                "jobs:\n"
+                "  deploy_prod:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - run: |\n"
+                "          echo preparing release\n"
+                "          ./deploy.sh\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(len(fact.ci_pipeline_map), 1)
+            pipeline = fact.ci_pipeline_map[0]
+            self.assertEqual(set(pipeline.triggers), {"push"})
+            self.assertTrue(any(job.job_id == "deploy_prod" for job in pipeline.jobs))
+            deploy_job = next(job for job in pipeline.jobs if job.job_id == "deploy_prod")
+            self.assertTrue(any("deploy.sh" in step for step in deploy_job.critical_steps))
+            self.assertTrue(any("deploy.sh" in step for step in pipeline.critical_steps))
+
+    def test_scanner_ci_ast_parses_filters_with_inline_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+            (repo / ".github" / "workflows" / "ci.yml").write_text(
+                "name: Commented CI\n"
+                "on:\n"
+                "  pull_request:\n"
+                "    types: [opened, synchronize] # PR event types\n"
+                "  push:\n"
+                "    branches: [main] # protected branch\n"
+                "jobs:\n"
+                "  build:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - run: python -m unittest discover -s tests -v\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(len(fact.ci_pipeline_map), 1)
+            pipeline = fact.ci_pipeline_map[0]
+            self.assertEqual(set(pipeline.triggers), {"pull_request", "push"})
+            self.assertIn("types=opened", pipeline.trigger_filters.get("pull_request", []))
+            self.assertIn("types=synchronize", pipeline.trigger_filters.get("pull_request", []))
+            self.assertIn("branches=main", pipeline.trigger_filters.get("push", []))
+
     def test_scanner_extracts_module_dependency_map(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
             repo = Path(repo_tmp)
@@ -301,6 +489,42 @@ class PipelineSmokeTest(unittest.TestCase):
             edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
             self.assertIn(("services", "core"), edge_pairs)
             self.assertFalse(any(source.endswith(".py") for source, _ in edge_pairs))
+
+    def test_scanner_dependency_map_python_relative_import_prefers_module_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "src" / "myapp" / "core").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "myapp" / "services").mkdir(parents=True, exist_ok=True)
+            (repo / "src" / "myapp" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "core" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "services" / "__init__.py").write_text("", encoding="utf-8")
+            (repo / "src" / "myapp" / "core" / "utils.py").write_text("def ping():\n    return 'pong'\n", encoding="utf-8")
+            (repo / "src" / "myapp" / "services" / "runner.py").write_text(
+                "from ..core.utils import ping\n",
+                encoding="utf-8",
+            )
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            edge_pairs = {(edge.source_module, edge.target_module) for edge in fact.module_dependency_map}
+            self.assertIn(("services", "core"), edge_pairs)
+            self.assertNotIn(("services", "src"), edge_pairs)
+
+    def test_scanner_does_not_infer_tests_map_without_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_tmp:
+            repo = Path(repo_tmp)
+            (repo / "pyproject.toml").write_text("[project]\nname='sample'\n", encoding="utf-8")
+            (repo / "main.py").write_text("print('hello')\n", encoding="utf-8")
+
+            scanner = ScannerEngine()
+            fact = scanner.scan(repo_path=repo, profile="balanced")
+
+            self.assertEqual(fact.tests_map, [])
+            self.assertFalse(any(cmd == "python -m unittest discover -s tests -v" for cmd in fact.key_commands))
+            unknown_ids = {item.unknown_id for item in fact.unknowns}
+            self.assertIn("u_tests_001", unknown_ids)
 
     def test_scanner_dependency_map_ts_alias_paths(self) -> None:
         with tempfile.TemporaryDirectory() as repo_tmp:
@@ -475,6 +699,34 @@ class PipelineSmokeTest(unittest.TestCase):
         questions = engine.build_questions(fact_model=fact_model, profile="quick")
         self.assertEqual(len(questions), 10)
 
+    def test_questionnaire_enforces_profile_minimum_question_floor(self) -> None:
+        engine = QuestionnaireEngine()
+        fact_model = FactModel(
+            repo_id="repo",
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_workflow_001",
+                    area="workflow",
+                    description="Workflow unknown",
+                    impact_level="high",
+                    suggested_question="Workflow boundary?",
+                )
+            ],
+            entry_points=["main.py"],
+            key_commands=["python -m app"],
+        )
+
+        quick_questions = engine.build_questions(fact_model=fact_model, profile="quick")
+        balanced_questions = engine.build_questions(fact_model=fact_model, profile="balanced")
+        strict_questions = engine.build_questions(fact_model=fact_model, profile="strict")
+
+        self.assertGreaterEqual(len(quick_questions), 3)
+        self.assertGreaterEqual(len(balanced_questions), 5)
+        self.assertGreaterEqual(len(strict_questions), 7)
+
+        self.assertTrue(any(item.get("question_type") == "hypothesis" for item in quick_questions))
+        self.assertTrue(any(str(item.get("target_id", "")).startswith("h_floor_") for item in strict_questions))
+
     def test_questionnaire_prioritizes_hypothesis_questions_and_hides_duplicate_unknown(self) -> None:
         engine = QuestionnaireEngine()
         fact_model = FactModel(
@@ -552,13 +804,87 @@ class PipelineSmokeTest(unittest.TestCase):
 
     def _validator_ready_artifacts(self) -> dict[str, str]:
         return {
-            "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- python\n\n## S2\n- module\n\n## S3\n- main.py\n\n## S4\n- ext\n\n## S5\n- u_workflow_001\n",
-            "PROJECT_STATE.md": "# S\n\n## S1\n- u_workflow_001\n\n## S2\n- ok\n",
-            "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. main.py\n\n## S2\n- python -m unittest discover -s tests -v\n",
-            "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
-            "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
-            "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
-            "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
+            "PROJECT_ARCHITECTURE.md": (
+                "# PROJECT_ARCHITECTURE\n\n"
+                "## Обнаруженные стеки\n"
+                "- python\n\n"
+                "## Модули и границы\n"
+                "- module\n\n"
+                "## Точки входа и команды запуска\n"
+                "- entry: main.py\n"
+                "- cmd: python -m unittest discover -s tests -v\n\n"
+                "## Внешние интеграции и CI/CD\n"
+                "- ext\n\n"
+                "## Зависимости между модулями\n"
+                "- module -> core\n\n"
+                "## Критичные файлы\n"
+                "- pyproject.toml\n\n"
+                "## Открытые решения\n"
+                "- u_workflow_001: open\n"
+            ),
+            "PROJECT_STATE.md": (
+                "# PROJECT_STATE\n\n"
+                "## Снимок прогона\n"
+                "- repo_id=repo\n\n"
+                "## Операционная готовность\n"
+                "- entry_points=1\n"
+                "- key_commands=1\n\n"
+                "## Неопределенности и риски\n"
+                "- u_workflow_001: open\n\n"
+                "## Предупреждения сканера\n"
+                "- none\n"
+            ),
+            "FIRST_MESSAGE_INSTRUCTIONS.md": (
+                "# FIRST_MESSAGE_INSTRUCTIONS\n\n"
+                "## Порядок чтения контекста\n"
+                "1. PROJECT_STATE.md\n\n"
+                "## Чеклист первого сообщения\n"
+                "1. main.py\n\n"
+                "## Что проверить после изменений\n"
+                "- python -m unittest discover -s tests -v\n\n"
+                "## Открытые решения перед рисковыми правками\n"
+                "- u_workflow_001: open\n"
+            ),
+            "HANDOFF_PROTOCOL.md": (
+                "# HANDOFF_PROTOCOL\n\n"
+                "## Что передать в следующий чат\n"
+                "- Rule B\n\n"
+                "## Обязательный шаблон handoff\n"
+                "1. next\n\n"
+                "## Что осталось открытым\n"
+                "- u_workflow_001: open\n"
+            ),
+            "AGENT_BEHAVIOR_RULES.md": (
+                "# AGENT_BEHAVIOR_RULES\n\n"
+                "## Базовые правила\n"
+                "- Rule A\n\n"
+                "## Эскалация\n"
+                "- Rule D\n\n"
+                "## Конфликты и ограничения\n"
+                "- none\n\n"
+                "## Открытые решения\n"
+                "- u_workflow_001: open\n"
+            ),
+            "CONTEXT_UPDATE_POLICY.md": (
+                "# CONTEXT_UPDATE_POLICY\n\n"
+                "## Когда обновлять контекст\n"
+                "- Rule C\n\n"
+                "## Обязательные файлы\n"
+                "1. docs/PROJECT_STATE.md\n\n"
+                "## Порядок обновления\n"
+                "1. sync\n\n"
+                "## Проверка перед push\n"
+                "1. done\n"
+            ),
+            "TASK_TRACKING_PROTOCOL.md": (
+                "# TASK_TRACKING_PROTOCOL\n\n"
+                "## Лимит и статусы активных задач\n"
+                "- <= 12\n\n"
+                "## Формат отчета по итерации\n"
+                "1. Completed\n\n"
+                "## Правила архивации\n"
+                "- archive\n"
+            ),
             "VALIDATION_REPORT.json": "{}",
         }
 
@@ -636,21 +962,50 @@ class PipelineSmokeTest(unittest.TestCase):
         )
         validator = ValidatorEngine()
         report = validator.validate(
-            artifacts={
-                "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- python\n\n## S2\n- module\n\n## S3\n- main.py\n\n## S4\n- ext\n\n## S5\n- u_workflow_001\n",
-                "PROJECT_STATE.md": "# S\n\n## S1\n- u_workflow_001\n\n## S2\n- ok\n",
-                "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. main.py\n\n## S2\n- python -m unittest discover -s tests -v\n",
-                "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
-                "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
-                "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
-                "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
-                "VALIDATION_REPORT.json": "{}",
-            },
+            artifacts=self._validator_ready_artifacts(),
             fact_model=fact_model,
             policy_model=policy_model,
         )
         issue_ids = {issue.issue_id for issue in report.issues}
         self.assertIn("unknown_resolution_overlap", issue_ids)
+
+    def test_validator_phase5_checks_visibility_for_all_open_unknowns(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["python -m unittest discover -s tests -v"],
+            confidence_overall=0.9,
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_workflow_001",
+                    area="workflow",
+                    description="Workflow unknown",
+                    impact_level="high",
+                    suggested_question="Workflow boundary?",
+                ),
+                UnknownItem(
+                    unknown_id="u_tests_001",
+                    area="testing",
+                    description="Tests unknown",
+                    impact_level="high",
+                    suggested_question="Where are tests?",
+                ),
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_workflow_001", "u_tests_001"])
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("project_state_unknown_visibility_gap", issue_ids)
+        self.assertIn("architecture_unknown_visibility_gap", issue_ids)
+        self.assertIn("first_message_unknown_visibility_gap", issue_ids)
+        self.assertIn("handoff_unknown_visibility_gap", issue_ids)
+        self.assertIn("behavior_unknown_visibility_gap", issue_ids)
 
     def test_validator_phase5_detects_operability_gaps_without_unknowns(self) -> None:
         fact_model = FactModel(
@@ -678,16 +1033,7 @@ class PipelineSmokeTest(unittest.TestCase):
         )
         validator = ValidatorEngine()
         report = validator.validate(
-            artifacts={
-                "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- UNKNOWN\n\n## S2\n- module\n\n## S3\n- none\n\n## S4\n- ext\n\n## S5\n- u_workflow_001\n",
-                "PROJECT_STATE.md": "# S\n\n## S1\n- u_workflow_001\n\n## S2\n- ok\n",
-                "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. start\n\n## S2\n- boundaries\n",
-                "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
-                "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
-                "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
-                "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
-                "VALIDATION_REPORT.json": "{}",
-            },
+            artifacts=self._validator_ready_artifacts(),
             fact_model=fact_model,
             policy_model=policy_model,
         )
@@ -880,13 +1226,92 @@ class PipelineSmokeTest(unittest.TestCase):
         )
         policy_model = self._validator_ready_policy(open_unknowns=["u_hypothesis_001", "u_tests_001"])
         artifacts = {
-            "PROJECT_ARCHITECTURE.md": "# A\n\n## S1\n- python\n\n## S2\n- module\n\n## S3\n- fallback\n\n## S4\n- ext\n\n## S5\n- u_hypothesis_001\n",
-            "PROJECT_STATE.md": "# S\n\n## S1\n- u_hypothesis_001\n\n## S2\n- ok\n",
-            "FIRST_MESSAGE_INSTRUCTIONS.md": "# F\n\n## S1\n1. README.md (manual entrypoint reference)\n\n## S2\n- make build\n",
-            "HANDOFF_PROTOCOL.md": "# H\n\n## S1\n- a\n\n## S2\n- b\n",
-            "AGENT_BEHAVIOR_RULES.md": "# B\n\n## S1\n- a\n\n## S2\n- b\n\n## S3\n- c\n",
-            "CONTEXT_UPDATE_POLICY.md": "# C\n\n## S1\n- a\n\n## S2\n- b\n",
-            "TASK_TRACKING_PROTOCOL.md": "# T\n\n## S1\n1. a\n\n## S2\n- b\n",
+            "PROJECT_ARCHITECTURE.md": (
+                "# PROJECT_ARCHITECTURE\n\n"
+                "## Обнаруженные стеки\n"
+                "- python\n\n"
+                "## Модули и границы\n"
+                "- module\n\n"
+                "## Точки входа и команды запуска\n"
+                "- entry: README.md (manual entrypoint reference)\n"
+                "- cmd: make build\n\n"
+                "## Внешние интеграции и CI/CD\n"
+                "- ext\n\n"
+                "## Зависимости между модулями\n"
+                "- module -> core\n\n"
+                "## Критичные файлы\n"
+                "- pyproject.toml\n\n"
+                "## Открытые решения\n"
+                "- u_hypothesis_001: open\n"
+                "- u_tests_001: open\n"
+            ),
+            "PROJECT_STATE.md": (
+                "# PROJECT_STATE\n\n"
+                "## Снимок прогона\n"
+                "- repo_id=repo\n\n"
+                "## Операционная готовность\n"
+                "- entry_points=1\n"
+                "- key_commands=1\n\n"
+                "## Неопределенности и риски\n"
+                "- u_hypothesis_001: open\n"
+                "- u_tests_001: open\n\n"
+                "## Предупреждения сканера\n"
+                "- none\n"
+            ),
+            "FIRST_MESSAGE_INSTRUCTIONS.md": (
+                "# FIRST_MESSAGE_INSTRUCTIONS\n\n"
+                "## Порядок чтения контекста\n"
+                "1. PROJECT_STATE.md\n\n"
+                "## Чеклист первого сообщения\n"
+                "1. README.md (manual entrypoint reference)\n\n"
+                "## Что проверить после изменений\n"
+                "- make build\n\n"
+                "## Открытые решения перед рисковыми правками\n"
+                "- u_hypothesis_001: open\n"
+                "- u_tests_001: open\n"
+            ),
+            "HANDOFF_PROTOCOL.md": (
+                "# HANDOFF_PROTOCOL\n\n"
+                "## Что передать в следующий чат\n"
+                "- Rule B\n\n"
+                "## Обязательный шаблон handoff\n"
+                "1. next\n\n"
+                "## Что осталось открытым\n"
+                "- u_hypothesis_001: open\n"
+                "- u_tests_001: open\n"
+            ),
+            "AGENT_BEHAVIOR_RULES.md": (
+                "# AGENT_BEHAVIOR_RULES\n\n"
+                "## Базовые правила\n"
+                "- Rule A\n\n"
+                "## Эскалация\n"
+                "- Rule D\n\n"
+                "## Конфликты и ограничения\n"
+                "- none\n\n"
+                "## Открытые решения\n"
+                "- u_hypothesis_001: open\n"
+                "- u_tests_001: open\n"
+            ),
+            "CONTEXT_UPDATE_POLICY.md": (
+                "# CONTEXT_UPDATE_POLICY\n\n"
+                "## Когда обновлять контекст\n"
+                "- Rule C\n\n"
+                "## Обязательные файлы\n"
+                "1. docs/PROJECT_STATE.md\n\n"
+                "## Порядок обновления\n"
+                "1. sync\n\n"
+                "## Проверка перед push\n"
+                "1. done\n"
+            ),
+            "TASK_TRACKING_PROTOCOL.md": (
+                "# TASK_TRACKING_PROTOCOL\n\n"
+                "## Лимит и статусы активных задач\n"
+                "- <= 12\n\n"
+                "## Формат отчета по итерации\n"
+                "1. Completed\n\n"
+                "## Правила архивации\n"
+                "- archive\n"
+            ),
             "VALIDATION_REPORT.json": "{}",
         }
 
@@ -901,6 +1326,192 @@ class PipelineSmokeTest(unittest.TestCase):
         self.assertNotIn("entrypoint_fallback_unconfirmed", issue_ids)
         self.assertNotIn("test_command_missing_without_unknown", issue_ids)
         self.assertFalse(report.blocking_status)
+
+    def test_validator_phase3_detects_missing_parity_section_title(self) -> None:
+        artifacts = self._validator_ready_artifacts()
+        artifacts["PROJECT_STATE.md"] = artifacts["PROJECT_STATE.md"].replace(
+            "## Операционная готовность",
+            "## Операционная готовность (legacy)",
+        )
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=artifacts,
+            fact_model=FactModel(repo_id="repo"),
+            policy_model=self._validator_ready_policy(),
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("parity_section_missing_project_state_02", issue_ids)
+
+    def test_validator_phase3_blocks_on_missing_critical_parity_section(self) -> None:
+        artifacts = self._validator_ready_artifacts()
+        artifacts["FIRST_MESSAGE_INSTRUCTIONS.md"] = artifacts["FIRST_MESSAGE_INSTRUCTIONS.md"].replace(
+            "## Порядок чтения контекста",
+            "## Порядок чтения",
+        )
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=artifacts,
+            fact_model=FactModel(repo_id="repo"),
+            policy_model=self._validator_ready_policy(),
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("parity_section_missing_first_message_instructions_01", issue_ids)
+        self.assertTrue(report.blocking_status)
+
+    def test_validator_phase7_detects_entrypoint_ambiguity_without_tracking(self) -> None:
+        entrypoints = [f"sample/{idx:02d}/main.py" for idx in range(14)]
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=entrypoints,
+            key_commands=["python -m unittest discover -s tests -v"],
+        )
+        policy_model = self._validator_ready_policy()
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("entrypoint_ambiguity_high", issue_ids)
+        self.assertIn("entrypoint_primary_non_primary_path", issue_ids)
+
+    def test_validator_phase7_detects_command_ambiguity_without_tracking(self) -> None:
+        commands = [f"npm run test:unit:{idx:02d}" for idx in range(14)]
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=commands,
+        )
+        policy_model = self._validator_ready_policy()
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("command_ambiguity_high", issue_ids)
+        self.assertIn("test_command_ambiguity_high", issue_ids)
+
+    def test_validator_phase7_skips_ambiguity_when_tracked_unknowns_exist(self) -> None:
+        entrypoints = [f"sample/{idx:02d}/main.py" for idx in range(14)]
+        commands = [f"npm run test:unit:{idx:02d}" for idx in range(14)]
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=entrypoints,
+            key_commands=commands,
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_entrypoint_001",
+                    area="architecture",
+                    description="Entrypoint ambiguity is tracked",
+                    impact_level="high",
+                    suggested_question="Confirm canonical entrypoint?",
+                ),
+                UnknownItem(
+                    unknown_id="u_commands_001",
+                    area="workflow",
+                    description="Command ambiguity is tracked",
+                    impact_level="high",
+                    suggested_question="Confirm canonical run/test command?",
+                ),
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_entrypoint_001", "u_commands_001"])
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertNotIn("entrypoint_ambiguity_high", issue_ids)
+        self.assertNotIn("entrypoint_primary_non_primary_path", issue_ids)
+        self.assertNotIn("command_ambiguity_high", issue_ids)
+        self.assertNotIn("test_command_ambiguity_high", issue_ids)
+
+    def test_validator_phase7_detects_ci_primary_workflow_low_confidence(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["python -m unittest discover -s tests -v"],
+            environments=["github-actions"],
+            external_integrations=["github-actions"],
+            ci_pipeline_map=[
+                CiPipelineFact(
+                    provider="github-actions",
+                    file=".github/workflows/add-to-project.yml",
+                    name="Add to Project",
+                    triggers=["issues"],
+                    jobs=[CiJobFact(job_id="triage", name="triage")],
+                ),
+                CiPipelineFact(
+                    provider="github-actions",
+                    file=".github/workflows/test.yml",
+                    name="Test",
+                    triggers=["push", "pull_request"],
+                    jobs=[CiJobFact(job_id="test", name="test")],
+                ),
+            ],
+        )
+        policy_model = self._validator_ready_policy()
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertIn("ci_primary_workflow_low_confidence", issue_ids)
+
+    def test_validator_phase7_skips_ci_primary_confidence_when_hypothesis_unknown_tracked(self) -> None:
+        fact_model = FactModel(
+            repo_id="repo",
+            entry_points=["main.py"],
+            key_commands=["python -m unittest discover -s tests -v"],
+            environments=["github-actions"],
+            external_integrations=["github-actions"],
+            unknowns=[
+                UnknownItem(
+                    unknown_id="u_hypothesis_001",
+                    area="delivery",
+                    description="Primary CI workflow is not confirmed",
+                    impact_level="high",
+                    suggested_question="Confirm primary CI workflow?",
+                )
+            ],
+            ci_pipeline_map=[
+                CiPipelineFact(
+                    provider="github-actions",
+                    file=".github/workflows/add-to-project.yml",
+                    name="Add to Project",
+                    triggers=["issues"],
+                    jobs=[CiJobFact(job_id="triage", name="triage")],
+                ),
+                CiPipelineFact(
+                    provider="github-actions",
+                    file=".github/workflows/test.yml",
+                    name="Test",
+                    triggers=["push", "pull_request"],
+                    jobs=[CiJobFact(job_id="test", name="test")],
+                ),
+            ],
+        )
+        policy_model = self._validator_ready_policy(open_unknowns=["u_hypothesis_001"])
+
+        validator = ValidatorEngine()
+        report = validator.validate(
+            artifacts=self._validator_ready_artifacts(),
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        issue_ids = {issue.issue_id for issue in report.issues}
+        self.assertNotIn("ci_primary_workflow_low_confidence", issue_ids)
 
 
 if __name__ == "__main__":

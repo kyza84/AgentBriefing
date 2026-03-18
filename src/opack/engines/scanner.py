@@ -93,6 +93,10 @@ CRITICAL_FILE_RULES = [
 
 LOW_RELEVANCE_ENTRYPOINT_PREFIXES = (
     ".github/",
+    "docs/",
+    "docs_src/",
+    "sample/",
+    "samples/",
     "examples/",
     "example/",
     "test/",
@@ -103,7 +107,17 @@ LOW_RELEVANCE_ENTRYPOINT_PREFIXES = (
 LOW_RELEVANCE_COMMAND_MARKERS = (
     "bench",
     "benchmark",
+    "publish",
+    "release",
+    "deploy",
+    "docker:up",
+    "docker:down",
+    "docs",
+    "example",
+    "sample",
 )
+
+MODULE_PATH_ROOT_HINTS = {"src", "lib", "app", "apps", "pkg", "packages"}
 
 DEPENDENCY_FILE_LIMIT_BY_PROFILE = {
     "quick": 1200,
@@ -160,7 +174,11 @@ class ScannerEngine:
         modules = self._collect_modules(repo, files)
         entry_points = self._rank_entry_points(self._detect_entry_points(repo, rel_files, file_names))
         environments = self._detect_environments(file_names, rel_files)
-        key_commands, command_warnings = self._detect_commands(repo, file_names)
+        key_commands, command_warnings = self._detect_commands(
+            repo=repo,
+            file_names=file_names,
+            rel_files=rel_files,
+        )
         key_commands = self._rank_key_commands(key_commands)
         warnings.extend(command_warnings)
         external_integrations = self._detect_external_integrations(file_names, rel_files)
@@ -466,7 +484,7 @@ class ScannerEngine:
             if lower.startswith(("src/", "app/", "cmd/")):
                 total += 2
             if any(lower.startswith(prefix) for prefix in LOW_RELEVANCE_ENTRYPOINT_PREFIXES):
-                total -= 3
+                total -= 6
             if "/test" in f"/{lower}" or "/bench" in f"/{lower}":
                 total -= 2
             if "pyproject:script:" in lower or "package.json:bin:" in lower:
@@ -494,7 +512,7 @@ class ScannerEngine:
             env.append("github-actions")
         return sorted(set(env))
 
-    def _detect_commands(self, repo: Path, file_names: set[str]) -> tuple[list[str], list[str]]:
+    def _detect_commands(self, repo: Path, file_names: set[str], rel_files: list[str]) -> tuple[list[str], list[str]]:
         commands: list[str] = []
         warnings: list[str] = []
 
@@ -532,15 +550,24 @@ class ScannerEngine:
             except Exception as exc:
                 warnings.append(f"Failed to parse pyproject scripts: {exc}")
 
+        has_python_test_files = any(
+            rel.lower().endswith(".py") and self._is_test_file(rel.lower())
+            for rel in rel_files
+        )
+        has_js_ts_test_files = any(
+            rel.lower().endswith((".js", ".jsx", ".ts", ".tsx")) and self._is_test_file(rel.lower())
+            for rel in rel_files
+        )
+
         if "requirements.txt" in file_names:
             commands.append("pip install -r requirements.txt")
-        if "pyproject.toml" in file_names:
+        if "pyproject.toml" in file_names and has_python_test_files:
             commands.append("python -m unittest discover -s tests -v")
         if "go.mod" in file_names:
             commands.append("go test ./...")
         if "cargo.toml" in file_names:
             commands.append("cargo test")
-        if "package.json" in file_names and not any("npm run test" in c for c in commands):
+        if "package.json" in file_names and has_js_ts_test_files and not any("npm run test" in c for c in commands):
             commands.append("npm run test")
 
         return sorted(set(commands)), warnings
@@ -556,7 +583,7 @@ class ScannerEngine:
             if "lint" in lower:
                 total += 1
             if any(marker in lower for marker in LOW_RELEVANCE_COMMAND_MARKERS):
-                total -= 3
+                total -= 4
             if any(token in lower for token in ("dev", "start", "serve")):
                 total -= 1
             return total
@@ -581,7 +608,6 @@ class ScannerEngine:
     def _detect_tests(self, rel_files: list[str], detected_stacks: list[str], key_commands: list[str]) -> list[TestSuiteFact]:
         test_roots: set[str] = set()
         frameworks: set[str] = set()
-        inferred_roots: set[str] = set()
 
         for rel in rel_files:
             lower = rel.lower()
@@ -619,8 +645,7 @@ class ScannerEngine:
             return []
 
         if not test_roots:
-            test_roots.add("tests")
-            inferred_roots.add("tests")
+            return []
         if not frameworks:
             frameworks.add("unknown-test")
 
@@ -641,8 +666,6 @@ class ScannerEngine:
         suites: list[TestSuiteFact] = []
         for idx, path in enumerate(sorted(test_roots)[:10], start=1):
             confidence = 0.85 if "test" in path.lower() else 0.65
-            if path in inferred_roots:
-                confidence = min(confidence, 0.55)
             suites.append(
                 TestSuiteFact(
                     suite_id=f"t_{idx:03d}",
@@ -706,7 +729,7 @@ class ScannerEngine:
             )
 
         pipelines: list[CiPipelineFact] = []
-        for rel in sorted(workflow_files):
+        for rel in workflow_files:
             if self._time_budget_exceeded(guardrail_state=guardrail_state, scan_started_at=scan_started_at):
                 self._activate_guardrail(
                     guardrail_state=guardrail_state,
@@ -722,9 +745,20 @@ class ScannerEngine:
             except OSError:
                 continue
             lines = content.splitlines()
-            name = self._extract_workflow_name(lines) or Path(rel).stem
-            triggers, trigger_filters = self._extract_workflow_events(lines)
-            jobs = self._extract_workflow_jobs(lines)
+            workflow_doc = self._parse_ci_workflow_ast(content=content)
+            if workflow_doc is not None:
+                raw_name = workflow_doc.get("name")
+                name = self._parse_yaml_scalar(str(raw_name)) if raw_name is not None else ""
+                if not name:
+                    name = self._extract_workflow_name(lines)
+                if not name:
+                    name = Path(rel).stem
+                triggers, trigger_filters = self._extract_workflow_events_from_node(workflow_doc.get("on"))
+                jobs = self._extract_workflow_jobs_from_node(workflow_doc.get("jobs"))
+            else:
+                name = self._extract_workflow_name(lines) or Path(rel).stem
+                triggers, trigger_filters = self._extract_workflow_events(lines)
+                jobs = self._extract_workflow_jobs(lines)
             critical_steps = self._extract_ci_critical_steps(lines=lines, jobs=jobs)
             confidence = 0.5
             if triggers:
@@ -755,6 +789,421 @@ class ScannerEngine:
             if match:
                 return match.group(1).strip("'\"")
         return ""
+
+    def _parse_ci_workflow_ast(self, content: str) -> dict[str, object] | None:
+        tokens = self._yaml_tokenize(content=content)
+        if not tokens:
+            return {}
+        try:
+            node, _next_idx = self._parse_yaml_node(tokens=tokens, start_idx=0)
+        except ValueError:
+            return None
+        return node if isinstance(node, dict) else None
+
+    def _yaml_tokenize(self, content: str) -> list[tuple[int, str]]:
+        tokens: list[tuple[int, str]] = []
+        for raw_line in content.splitlines():
+            expanded = raw_line.replace("\t", "    ").rstrip()
+            stripped = expanded.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            indent = len(expanded) - len(expanded.lstrip(" "))
+            payload = expanded[indent:]
+            if not payload:
+                continue
+            tokens.append((indent, payload))
+        return tokens
+
+    def _parse_yaml_node(self, tokens: list[tuple[int, str]], start_idx: int) -> tuple[object, int]:
+        if start_idx >= len(tokens):
+            raise ValueError("yaml_unexpected_end")
+        indent, payload = tokens[start_idx]
+        payload_clean = self._strip_inline_yaml_comment(payload).strip()
+        if payload_clean.startswith("-"):
+            return self._parse_yaml_sequence(tokens=tokens, start_idx=start_idx, indent=indent)
+        return self._parse_yaml_mapping(tokens=tokens, start_idx=start_idx, indent=indent)
+
+    def _parse_yaml_mapping(
+        self,
+        tokens: list[tuple[int, str]],
+        start_idx: int,
+        indent: int,
+    ) -> tuple[dict[str, object], int]:
+        mapping: dict[str, object] = {}
+        idx = start_idx
+        while idx < len(tokens):
+            current_indent, payload = tokens[idx]
+            if current_indent < indent:
+                break
+            if current_indent > indent:
+                raise ValueError("yaml_unexpected_mapping_indent")
+
+            cleaned_payload = self._strip_inline_yaml_comment(payload).strip()
+            if not cleaned_payload:
+                idx += 1
+                continue
+            if cleaned_payload.startswith("-"):
+                break
+
+            pair = self._split_key_value_top_level(cleaned_payload)
+            if pair is None:
+                raise ValueError("yaml_invalid_mapping_pair")
+            raw_key, raw_value = pair
+            key = self._yaml_key(raw_key)
+            if not key:
+                raise ValueError("yaml_empty_mapping_key")
+
+            value_inline = self._strip_inline_yaml_comment(raw_value).strip()
+            idx += 1
+            if value_inline:
+                if self._is_yaml_block_scalar(value_inline):
+                    block_lines: list[str] = []
+                    while idx < len(tokens):
+                        next_indent, next_payload = tokens[idx]
+                        if next_indent <= current_indent:
+                            break
+                        block_lines.append(next_payload)
+                        idx += 1
+                    value: object = "\n".join(line.rstrip() for line in block_lines).strip()
+                else:
+                    value = self._parse_yaml_value(value_inline)
+            else:
+                if idx < len(tokens) and tokens[idx][0] > current_indent:
+                    value, idx = self._parse_yaml_node(tokens=tokens, start_idx=idx)
+                else:
+                    value = None
+
+            mapping[key] = value
+        return mapping, idx
+
+    def _parse_yaml_sequence(
+        self,
+        tokens: list[tuple[int, str]],
+        start_idx: int,
+        indent: int,
+    ) -> tuple[list[object], int]:
+        items: list[object] = []
+        idx = start_idx
+        while idx < len(tokens):
+            current_indent, payload = tokens[idx]
+            if current_indent < indent:
+                break
+            if current_indent > indent:
+                raise ValueError("yaml_unexpected_sequence_indent")
+
+            cleaned_payload = self._strip_inline_yaml_comment(payload).strip()
+            if not cleaned_payload:
+                idx += 1
+                continue
+            if not cleaned_payload.startswith("-"):
+                break
+
+            item_payload = cleaned_payload[1:].strip()
+            idx += 1
+
+            if not item_payload:
+                if idx < len(tokens) and tokens[idx][0] > current_indent:
+                    child, idx = self._parse_yaml_node(tokens=tokens, start_idx=idx)
+                    items.append(child)
+                else:
+                    items.append(None)
+                continue
+
+            pair = self._split_key_value_top_level(item_payload)
+            if pair is None:
+                items.append(self._parse_yaml_value(item_payload))
+                continue
+
+            raw_key, raw_value = pair
+            key = self._yaml_key(raw_key)
+            if not key:
+                raise ValueError("yaml_empty_sequence_mapping_key")
+
+            item_obj: dict[str, object] = {}
+            value_inline = self._strip_inline_yaml_comment(raw_value).strip()
+            entry_indent = current_indent + 2
+            if value_inline:
+                if self._is_yaml_block_scalar(value_inline):
+                    block_lines: list[str] = []
+                    while idx < len(tokens):
+                        next_indent, next_payload = tokens[idx]
+                        if next_indent <= entry_indent:
+                            break
+                        block_lines.append(next_payload)
+                        idx += 1
+                    item_obj[key] = "\n".join(line.rstrip() for line in block_lines).strip()
+                else:
+                    item_obj[key] = self._parse_yaml_value(value_inline)
+            else:
+                if idx < len(tokens) and tokens[idx][0] > current_indent:
+                    child, idx = self._parse_yaml_node(tokens=tokens, start_idx=idx)
+                    item_obj[key] = child
+                else:
+                    item_obj[key] = None
+
+            if idx < len(tokens) and tokens[idx][0] > current_indent:
+                child, idx = self._parse_yaml_node(tokens=tokens, start_idx=idx)
+                if isinstance(child, dict):
+                    item_obj.update(child)
+                elif item_obj.get(key) is None:
+                    item_obj[key] = child
+
+            items.append(item_obj)
+        return items, idx
+
+    def _parse_yaml_value(self, value: str) -> object:
+        token = self._strip_inline_yaml_comment(value).strip()
+        if not token:
+            return ""
+        if token in {"null", "~"}:
+            return None
+        if token.startswith("{") and token.endswith("}"):
+            return self._parse_yaml_inline_map(token)
+        if token.startswith("[") and token.endswith("]"):
+            return self._parse_yaml_inline_list(token)
+        return self._parse_yaml_scalar(token)
+
+    def _parse_yaml_inline_map(self, value: str) -> dict[str, object]:
+        body = value.strip()[1:-1].strip()
+        if not body:
+            return {}
+        result: dict[str, object] = {}
+        for chunk in self._split_top_level(body, ","):
+            pair = self._split_key_value_top_level(chunk)
+            if pair is None:
+                continue
+            key = self._yaml_key(pair[0])
+            if not key:
+                continue
+            result[key] = self._parse_yaml_value(pair[1])
+        return result
+
+    def _parse_yaml_inline_list(self, value: str) -> list[object]:
+        body = value.strip()[1:-1].strip()
+        if not body:
+            return []
+        items: list[object] = []
+        for chunk in self._split_top_level(body, ","):
+            token = chunk.strip()
+            if not token:
+                continue
+            items.append(self._parse_yaml_value(token))
+        return items
+
+    def _yaml_key(self, raw_key: str) -> str:
+        return self._parse_yaml_scalar(raw_key)
+
+    def _is_yaml_block_scalar(self, value: str) -> bool:
+        return value in {"|", ">", "|-", ">-", "|+", ">+"}
+
+    def _extract_workflow_events_from_node(self, on_node: object) -> tuple[list[str], dict[str, list[str]]]:
+        triggers: set[str] = set()
+        trigger_filters: dict[str, list[str]] = {}
+
+        if isinstance(on_node, dict):
+            for raw_event, config in on_node.items():
+                event_name = self._normalize_ci_token(str(raw_event))
+                if not self._is_ci_event_token(event_name):
+                    continue
+                triggers.add(event_name)
+                filters = self._extract_event_filters_from_node(config)
+                if filters:
+                    trigger_filters[event_name] = sorted(set(filters))
+        elif isinstance(on_node, list):
+            for item in on_node:
+                event_name = self._normalize_ci_token(str(item))
+                if self._is_ci_event_token(event_name):
+                    triggers.add(event_name)
+        elif on_node is not None:
+            event_name = self._normalize_ci_token(str(on_node))
+            if self._is_ci_event_token(event_name):
+                triggers.add(event_name)
+
+        normalized_filters = {
+            key: sorted(set(values))
+            for key, values in trigger_filters.items()
+            if values
+        }
+        return sorted(triggers), normalized_filters
+
+    def _extract_event_filters_from_node(self, config: object) -> list[str]:
+        if not isinstance(config, dict):
+            return []
+        filters: list[str] = []
+        for raw_filter_key, raw_filter_value in config.items():
+            filter_key = self._normalize_ci_token(str(raw_filter_key))
+            if filter_key in CI_EVENT_IGNORE_KEYS:
+                continue
+            if filter_key not in CI_TRIGGER_FILTER_KEYS:
+                continue
+            for scalar in self._node_to_scalar_values(raw_filter_value):
+                if scalar:
+                    filters.append(f"{filter_key}={scalar}")
+        return sorted(set(filters))
+
+    def _node_to_scalar_values(self, node: object) -> list[str]:
+        if node is None:
+            return []
+        if isinstance(node, list):
+            values: list[str] = []
+            for item in node:
+                values.extend(self._node_to_scalar_values(item))
+            return values
+        if isinstance(node, dict):
+            values: list[str] = []
+            for key, value in node.items():
+                value_tokens = self._node_to_scalar_values(value)
+                normalized_key = self._parse_yaml_scalar(str(key))
+                if value_tokens:
+                    values.extend(f"{normalized_key}={token}" for token in value_tokens if token)
+                elif normalized_key:
+                    values.append(normalized_key)
+            return values
+        return [self._parse_yaml_scalar(str(node))]
+
+    def _extract_workflow_jobs_from_node(self, jobs_node: object) -> list[CiJobFact]:
+        if not isinstance(jobs_node, dict):
+            return []
+        jobs: list[CiJobFact] = []
+        seen_job_ids: set[str] = set()
+        for raw_job_id, job_config in jobs_node.items():
+            job_id = self._normalize_ci_token(str(raw_job_id))
+            if not job_id or not re.match(r"^[a-z0-9_-]+$", job_id):
+                continue
+            if job_id in seen_job_ids:
+                continue
+            seen_job_ids.add(job_id)
+            critical_steps = self._extract_job_critical_steps_from_node(job_id=job_id, job_config=job_config)
+            jobs.append(
+                CiJobFact(
+                    job_id=job_id,
+                    name=self._parse_yaml_scalar(str(raw_job_id)) or job_id,
+                    critical_steps=critical_steps[:8],
+                )
+            )
+        return jobs
+
+    def _extract_job_critical_steps_from_node(self, job_id: str, job_config: object) -> list[str]:
+        run_or_use_steps: list[str] = []
+        critical_steps: list[str] = []
+        seen: set[str] = set()
+        job_hint = any(marker in job_id.lower() for marker in CI_RELEASE_JOB_HINTS)
+
+        steps = []
+        if isinstance(job_config, dict):
+            raw_steps = job_config.get("steps", [])
+            if isinstance(raw_steps, list):
+                steps = raw_steps
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            candidates: list[str] = []
+            if "run" in step:
+                run_value = self._node_to_inline_text(step.get("run"))
+                if run_value:
+                    candidates.append(f"run: {run_value}")
+            if "uses" in step:
+                uses_value = self._node_to_inline_text(step.get("uses"))
+                if uses_value:
+                    candidates.append(f"uses: {uses_value}")
+
+            for candidate in candidates:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                run_or_use_steps.append(candidate)
+
+                lowered = candidate.lower()
+                if any(keyword in lowered for keyword in CI_CRITICAL_KEYWORDS):
+                    critical_steps.append(candidate)
+                    continue
+                if job_hint and "run:" in lowered and any(word in lowered for word in ("deploy", "release", "publish")):
+                    critical_steps.append(candidate)
+
+        if job_hint and not critical_steps:
+            critical_steps.extend(run_or_use_steps[:2])
+
+        dedup: list[str] = []
+        dedup_seen: set[str] = set()
+        for step in critical_steps:
+            if step in dedup_seen:
+                continue
+            dedup_seen.add(step)
+            dedup.append(step)
+        return dedup
+
+    def _node_to_inline_text(self, node: object) -> str:
+        if node is None:
+            return ""
+        if isinstance(node, str):
+            return " ".join(node.split())
+        if isinstance(node, (int, float, bool)):
+            return str(node)
+        if isinstance(node, list):
+            parts: list[str] = []
+            for item in node:
+                item_text = self._node_to_inline_text(item)
+                if item_text:
+                    parts.append(item_text)
+            return " ".join(parts)
+        if isinstance(node, dict):
+            parts = []
+            for key, value in node.items():
+                key_text = self._parse_yaml_scalar(str(key))
+                value_text = self._node_to_inline_text(value)
+                if key_text and value_text:
+                    parts.append(f"{key_text}={value_text}")
+                elif key_text:
+                    parts.append(key_text)
+            return " ".join(parts)
+        return self._parse_yaml_scalar(str(node))
+
+    def _strip_inline_yaml_comment(self, value: str) -> str:
+        quote: str | None = None
+        escaped = False
+        depth_curly = 0
+        depth_square = 0
+        depth_round = 0
+        for idx, char in enumerate(value):
+            if quote:
+                if char == "\\" and not escaped:
+                    escaped = True
+                    continue
+                if char == quote and not escaped:
+                    quote = None
+                escaped = False
+                continue
+
+            if char in {"'", '"'}:
+                quote = char
+                continue
+            if char == "{":
+                depth_curly += 1
+                continue
+            if char == "}":
+                depth_curly = max(0, depth_curly - 1)
+                continue
+            if char == "[":
+                depth_square += 1
+                continue
+            if char == "]":
+                depth_square = max(0, depth_square - 1)
+                continue
+            if char == "(":
+                depth_round += 1
+                continue
+            if char == ")":
+                depth_round = max(0, depth_round - 1)
+                continue
+
+            if char != "#":
+                continue
+            if depth_curly or depth_square or depth_round:
+                continue
+            if idx == 0 or value[idx - 1].isspace():
+                return value[:idx].rstrip()
+        return value
 
     def _extract_workflow_events(self, lines: list[str]) -> tuple[list[str], dict[str, list[str]]]:
         root_on = self._extract_root_key_data(lines=lines, key="on")
@@ -1140,7 +1589,7 @@ class ScannerEngine:
         return result
 
     def _parse_yaml_scalar(self, value: str) -> str:
-        token = value.strip()
+        token = self._strip_inline_yaml_comment(value).strip()
         if not token:
             return ""
         if token in {"null", "~", "{}", "[]"}:
@@ -1501,7 +1950,7 @@ class ScannerEngine:
             parts = Path(rel_path).parts
             if not parts:
                 continue
-            if parts[0].lower() in {"src", "lib", "app", "apps", "pkg", "packages"} and len(parts) >= 2:
+            if parts[0].lower() in MODULE_PATH_ROOT_HINTS and len(parts) >= 2:
                 package_roots.add(parts[1])
             else:
                 package_roots.add(parts[0])
@@ -1580,7 +2029,7 @@ class ScannerEngine:
             return ""
         root = parts[0]
         lower = root.lower()
-        if lower in {"src", "lib", "app", "apps", "pkg", "packages"} and len(parts) >= 2:
+        if lower in MODULE_PATH_ROOT_HINTS and len(parts) >= 2:
             if parts[1] in python_package_roots and len(parts) >= 3:
                 return parts[2]
             return parts[1]
@@ -1677,6 +2126,12 @@ class ScannerEngine:
                 package_parts = package_parts[:-ascend] if ascend <= len(package_parts) else []
 
             tail_parts = [part for part in tail.split(".") if part]
+            # Relative imports should first resolve explicit tail tokens (e.g. "..core.utils" -> "core")
+            # before broader package-prefix candidates that may include structural roots.
+            for token in tail_parts:
+                if token in module_names:
+                    return token
+
             candidate_parts = package_parts + tail_parts
             for candidate in self._candidate_tokens_from_import_parts(
                 import_parts=candidate_parts,
@@ -1769,12 +2224,19 @@ class ScannerEngine:
         tokens: list[str] = []
         if import_parts[0] in python_package_roots and len(import_parts) > 1:
             tokens.extend(import_parts[1:])
+        for idx, value in enumerate(import_parts):
+            if value in python_package_roots and idx + 1 < len(import_parts):
+                tokens.extend(import_parts[idx + 1 :])
         tokens.extend(import_parts)
         dedup: list[str] = []
         seen: set[str] = set()
         for token in tokens:
             cleaned = token.strip()
             if not cleaned or cleaned in seen:
+                continue
+            if cleaned in MODULE_PATH_ROOT_HINTS and len(import_parts) > 1:
+                continue
+            if cleaned in python_package_roots and len(import_parts) > 1:
                 continue
             seen.add(cleaned)
             dedup.append(cleaned)

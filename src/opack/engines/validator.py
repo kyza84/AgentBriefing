@@ -16,14 +16,75 @@ class ValidatorEngine:
         "VALIDATION_REPORT.json",
     ]
 
+    _PARITY_SECTION_TITLES = {
+        "PROJECT_ARCHITECTURE.md": [
+            "Обнаруженные стеки",
+            "Модули и границы",
+            "Точки входа и команды запуска",
+            "Внешние интеграции и CI/CD",
+            "Зависимости между модулями",
+            "Критичные файлы",
+            "Открытые решения",
+        ],
+        "PROJECT_STATE.md": [
+            "Снимок прогона",
+            "Операционная готовность",
+            "Неопределенности и риски",
+            "Предупреждения сканера",
+        ],
+        "FIRST_MESSAGE_INSTRUCTIONS.md": [
+            "Порядок чтения контекста",
+            "Чеклист первого сообщения",
+            "Что проверить после изменений",
+            "Открытые решения перед рисковыми правками",
+        ],
+        "HANDOFF_PROTOCOL.md": [
+            "Что передать в следующий чат",
+            "Обязательный шаблон handoff",
+            "Что осталось открытым",
+        ],
+        "AGENT_BEHAVIOR_RULES.md": [
+            "Базовые правила",
+            "Эскалация",
+            "Конфликты и ограничения",
+            "Открытые решения",
+        ],
+        "CONTEXT_UPDATE_POLICY.md": [
+            "Когда обновлять контекст",
+            "Обязательные файлы",
+            "Порядок обновления",
+            "Проверка перед push",
+        ],
+        "TASK_TRACKING_PROTOCOL.md": [
+            "Лимит и статусы активных задач",
+            "Формат отчета по итерации",
+            "Правила архивации",
+        ],
+    }
+
     _MANDATORY_MARKDOWN_H2_COUNTS = {
-        "PROJECT_ARCHITECTURE.md": 5,
-        "PROJECT_STATE.md": 2,
-        "FIRST_MESSAGE_INSTRUCTIONS.md": 2,
-        "HANDOFF_PROTOCOL.md": 2,
-        "AGENT_BEHAVIOR_RULES.md": 3,
-        "CONTEXT_UPDATE_POLICY.md": 2,
-        "TASK_TRACKING_PROTOCOL.md": 2,
+        name: len(sections)
+        for name, sections in _PARITY_SECTION_TITLES.items()
+    }
+
+    _PARITY_SECTION_SEVERITY = {
+        "PROJECT_ARCHITECTURE.md": Severity.MAJOR,
+        "PROJECT_STATE.md": Severity.MAJOR,
+        "FIRST_MESSAGE_INSTRUCTIONS.md": Severity.CRITICAL,
+        "HANDOFF_PROTOCOL.md": Severity.MAJOR,
+        "AGENT_BEHAVIOR_RULES.md": Severity.MAJOR,
+        "CONTEXT_UPDATE_POLICY.md": Severity.CRITICAL,
+        "TASK_TRACKING_PROTOCOL.md": Severity.MAJOR,
+    }
+
+    _PARITY_ARTIFACT_SLUG = {
+        "PROJECT_ARCHITECTURE.md": "project_architecture",
+        "PROJECT_STATE.md": "project_state",
+        "FIRST_MESSAGE_INSTRUCTIONS.md": "first_message_instructions",
+        "HANDOFF_PROTOCOL.md": "handoff_protocol",
+        "AGENT_BEHAVIOR_RULES.md": "agent_behavior_rules",
+        "CONTEXT_UPDATE_POLICY.md": "context_update_policy",
+        "TASK_TRACKING_PROTOCOL.md": "task_tracking_protocol",
     }
 
     _BLOCKING_MAJOR_ISSUES = {
@@ -33,6 +94,23 @@ class ValidatorEngine:
         "operability_entrypoint_missing_without_unknown",
         "operability_commands_missing_without_unknown",
     }
+
+    _ENTRYPOINT_AMBIGUITY_THRESHOLD = 12
+    _COMMAND_AMBIGUITY_THRESHOLD = 12
+    _TEST_COMMAND_AMBIGUITY_THRESHOLD = 5
+    _CI_PRIMARY_CONFIDENCE_GAP_THRESHOLD = 3
+    _NON_PRIMARY_ENTRYPOINT_PREFIXES = (
+        "docs/",
+        "docs_src/",
+        "sample/",
+        "samples/",
+        "examples/",
+        "example/",
+        "tests/",
+        "test/",
+        "bench/",
+        ".github/",
+    )
 
     def validate(
         self,
@@ -50,6 +128,8 @@ class ValidatorEngine:
             "fact_policy_consistency",
             "operational_applicability",
             "operational_fact_quality",
+            "operational_ambiguity",
+            "ci_primary_confidence",
             "scanner_signal_health",
         ]
 
@@ -97,6 +177,11 @@ class ValidatorEngine:
                             description=f"{name} has {h2_count} H2 sections, expected at least {expected_h2}.",
                             remediation="Regenerate artifact with all mandatory operational sections.",
                         )
+                    self._validate_parity_sections(
+                        issues=issues,
+                        artifact_name=name,
+                        content=content,
+                    )
 
         fact_unknown_ids = {u.unknown_id for u in fact_model.unknowns}
         resolved_unknown_ids = set(policy_model.resolved_unknowns)
@@ -170,6 +255,16 @@ class ValidatorEngine:
             policy_model=policy_model,
         )
         self._validate_operational_fact_quality(
+            issues=issues,
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        self._validate_operational_ambiguity(
+            issues=issues,
+            fact_model=fact_model,
+            policy_model=policy_model,
+        )
+        self._validate_ci_primary_confidence(
             issues=issues,
             fact_model=fact_model,
             policy_model=policy_model,
@@ -264,24 +359,86 @@ class ValidatorEngine:
             )
 
         if policy_model.open_unknowns:
-            primary_open_unknown = policy_model.open_unknowns[0]
-            if primary_open_unknown not in project_state:
+            missing_in_project_state = [uid for uid in policy_model.open_unknowns if uid not in project_state]
+            if missing_in_project_state:
+                sample = ", ".join(missing_in_project_state[:3])
                 self._append_issue(
                     issues=issues,
                     issue_id="project_state_unknown_visibility_gap",
                     severity=Severity.MAJOR,
                     artifact="PROJECT_STATE.md",
-                    description="Open unknowns are not visible in PROJECT_STATE.md.",
+                    description=(
+                        "Some open unknowns are not visible in PROJECT_STATE.md: "
+                        f"{sample}"
+                    ),
                     remediation="Expose all open unknown ids in PROJECT_STATE.md.",
                 )
-            if primary_open_unknown not in architecture:
+
+            missing_in_architecture = [uid for uid in policy_model.open_unknowns if uid not in architecture]
+            if missing_in_architecture:
+                sample = ", ".join(missing_in_architecture[:3])
                 self._append_issue(
                     issues=issues,
                     issue_id="architecture_unknown_visibility_gap",
                     severity=Severity.MINOR,
                     artifact="PROJECT_ARCHITECTURE.md",
-                    description="Open unknowns are not visible in PROJECT_ARCHITECTURE.md.",
+                    description=(
+                        "Some open unknowns are not visible in PROJECT_ARCHITECTURE.md: "
+                        f"{sample}"
+                    ),
                     remediation="Expose unknown-driven architecture risks in PROJECT_ARCHITECTURE.md.",
+                )
+
+            missing_in_first_message = [uid for uid in policy_model.open_unknowns if uid not in first_message]
+            if missing_in_first_message:
+                sample = ", ".join(missing_in_first_message[:3])
+                self._append_issue(
+                    issues=issues,
+                    issue_id="first_message_unknown_visibility_gap",
+                    severity=Severity.MAJOR,
+                    artifact="FIRST_MESSAGE_INSTRUCTIONS.md",
+                    description=(
+                        "Some open unknowns are not visible in FIRST_MESSAGE_INSTRUCTIONS.md: "
+                        f"{sample}"
+                    ),
+                    remediation=(
+                        "Expose all open unknown ids in FIRST_MESSAGE_INSTRUCTIONS.md "
+                        "under the risk/open-decisions section."
+                    ),
+                )
+
+            handoff = artifacts.get("HANDOFF_PROTOCOL.md", "")
+            missing_in_handoff = [uid for uid in policy_model.open_unknowns if uid not in handoff]
+            if missing_in_handoff:
+                sample = ", ".join(missing_in_handoff[:3])
+                self._append_issue(
+                    issues=issues,
+                    issue_id="handoff_unknown_visibility_gap",
+                    severity=Severity.MAJOR,
+                    artifact="HANDOFF_PROTOCOL.md",
+                    description=(
+                        "Some open unknowns are not visible in HANDOFF_PROTOCOL.md: "
+                        f"{sample}"
+                    ),
+                    remediation="Expose unresolved unknown ids in handoff transfer/open sections.",
+                )
+
+            missing_in_behavior = [uid for uid in policy_model.open_unknowns if uid not in behavior_rules]
+            if missing_in_behavior:
+                sample = ", ".join(missing_in_behavior[:3])
+                self._append_issue(
+                    issues=issues,
+                    issue_id="behavior_unknown_visibility_gap",
+                    severity=Severity.MAJOR,
+                    artifact="AGENT_BEHAVIOR_RULES.md",
+                    description=(
+                        "Some open unknowns are not visible in AGENT_BEHAVIOR_RULES.md: "
+                        f"{sample}"
+                    ),
+                    remediation=(
+                        "Expose unresolved behavior constraints by unknown id in "
+                        "AGENT_BEHAVIOR_RULES.md."
+                    ),
                 )
 
         if policy_model.conflict_log and policy_model.conflict_log[0] not in behavior_rules:
@@ -467,6 +624,172 @@ class ValidatorEngine:
         lower = command.strip().lower()
         return any(token in lower for token in ("test", "pytest", "unittest", "go test", "cargo test", "vitest", "jest"))
 
+    def _unique_command_candidates(self, fact_model: FactModel) -> list[str]:
+        ordered: list[str] = []
+        seen = set()
+        for command in fact_model.key_commands:
+            text = str(command).strip()
+            if not text:
+                continue
+            token = text.lower()
+            if token in seen:
+                continue
+            seen.add(token)
+            ordered.append(text)
+        for suite in fact_model.tests_map:
+            for command in suite.command_candidates:
+                text = str(command).strip()
+                if not text:
+                    continue
+                token = text.lower()
+                if token in seen:
+                    continue
+                seen.add(token)
+                ordered.append(text)
+        return ordered
+
+    def _validate_operational_ambiguity(
+        self,
+        issues: list[ValidationIssue],
+        fact_model: FactModel,
+        policy_model: PolicyModel,
+    ) -> None:
+        resolved_and_open = set(policy_model.resolved_unknowns) | set(policy_model.open_unknowns)
+        entrypoint_tracking = {"u_entrypoint_001", "u_hypothesis_001"} & resolved_and_open
+        command_tracking = {"u_commands_001", "u_tests_001", "u_hypothesis_001"} & resolved_and_open
+
+        entrypoints = [str(item).strip() for item in fact_model.entry_points if str(item).strip()]
+        if len(entrypoints) >= self._ENTRYPOINT_AMBIGUITY_THRESHOLD and not entrypoint_tracking:
+            sample = ", ".join(entrypoints[:3])
+            self._append_issue(
+                issues=issues,
+                issue_id="entrypoint_ambiguity_high",
+                severity=Severity.MAJOR,
+                artifact="FACT_MODEL",
+                description=(
+                    f"Too many entrypoint candidates ({len(entrypoints)}), canonical choice is ambiguous: {sample}"
+                ),
+                remediation=(
+                    "Track entrypoint ambiguity (u_entrypoint_001) or confirm one canonical entrypoint via questionnaire."
+                ),
+            )
+
+        if entrypoints and len(entrypoints) > 1 and not entrypoint_tracking:
+            primary_entry = entrypoints[0].lower().replace("\\", "/")
+            if primary_entry.startswith(self._NON_PRIMARY_ENTRYPOINT_PREFIXES):
+                self._append_issue(
+                    issues=issues,
+                    issue_id="entrypoint_primary_non_primary_path",
+                    severity=Severity.MAJOR,
+                    artifact="FACT_MODEL",
+                    description=(
+                        "Primary entrypoint candidate points to docs/sample/tests-like path while alternatives exist: "
+                        f"{entrypoints[0]}"
+                    ),
+                    remediation=(
+                        "Demote non-primary folders (docs/sample/tests) or confirm canonical runtime entrypoint manually."
+                    ),
+                )
+
+        unique_commands = self._unique_command_candidates(fact_model)
+        if len(unique_commands) >= self._COMMAND_AMBIGUITY_THRESHOLD and not command_tracking:
+            sample = ", ".join(unique_commands[:3])
+            self._append_issue(
+                issues=issues,
+                issue_id="command_ambiguity_high",
+                severity=Severity.MAJOR,
+                artifact="FACT_MODEL",
+                description=f"Too many command candidates ({len(unique_commands)}), canonical command is ambiguous: {sample}",
+                remediation="Track command ambiguity (u_commands_001) or confirm one canonical run/test command.",
+            )
+
+        test_commands = [command for command in unique_commands if self._is_test_command(command)]
+        if len(test_commands) >= self._TEST_COMMAND_AMBIGUITY_THRESHOLD and not command_tracking:
+            sample = ", ".join(test_commands[:3])
+            self._append_issue(
+                issues=issues,
+                issue_id="test_command_ambiguity_high",
+                severity=Severity.MAJOR,
+                artifact="FACT_MODEL",
+                description=(
+                    f"Multiple test command variants detected ({len(test_commands)}), "
+                    f"canonical post-change check is ambiguous: {sample}"
+                ),
+                remediation="Select and confirm one canonical post-change test command in questionnaire output.",
+            )
+
+    def _validate_ci_primary_confidence(
+        self,
+        issues: list[ValidationIssue],
+        fact_model: FactModel,
+        policy_model: PolicyModel,
+    ) -> None:
+        pipelines = list(fact_model.ci_pipeline_map)
+        if len(pipelines) < 2:
+            return
+
+        resolved_and_open = set(policy_model.resolved_unknowns) | set(policy_model.open_unknowns)
+        if "u_scan_budget_001" in resolved_and_open or bool(fact_model.scan_guardrails.get("activated")):
+            return
+        if "u_hypothesis_001" in resolved_and_open:
+            return
+
+        scored = [
+            (idx, pipeline, self._ci_pipeline_priority_score(pipeline))
+            for idx, pipeline in enumerate(pipelines)
+        ]
+        primary_idx, primary_pipeline, primary_score = scored[0]
+        best_idx, best_pipeline, best_score = max(scored, key=lambda item: item[2])
+
+        if best_idx == primary_idx:
+            return
+        if (best_score - primary_score) < self._CI_PRIMARY_CONFIDENCE_GAP_THRESHOLD:
+            return
+
+        self._append_issue(
+            issues=issues,
+            issue_id="ci_primary_workflow_low_confidence",
+            severity=Severity.MAJOR,
+            artifact="FACT_MODEL",
+            description=(
+                "Primary CI workflow selection appears low-confidence: "
+                f"selected `{primary_pipeline.file}` but stronger candidate is `{best_pipeline.file}`."
+            ),
+            remediation=(
+                "Confirm canonical CI workflow explicitly via questionnaire/policy "
+                "or improve scanner ranking heuristics for workflow priority."
+            ),
+        )
+
+    def _ci_pipeline_priority_score(self, pipeline: object) -> int:
+        file_path = str(getattr(pipeline, "file", "")).lower()
+        name = str(getattr(pipeline, "name", "")).lower()
+        text = f"{file_path} {name}"
+        score = 0
+        if any(token in text for token in ("ci", "build", "test")):
+            score += 3
+        if any(token in text for token in ("deploy", "release", "publish", "prod", "production")):
+            score += 3
+
+        triggers = {str(item).lower() for item in getattr(pipeline, "triggers", [])}
+        if {"push", "pull_request"} & triggers:
+            score += 2
+        if {"workflow_run", "release", "schedule"} & triggers:
+            score += 1
+
+        jobs = list(getattr(pipeline, "jobs", []))
+        if jobs:
+            score += 1
+            for job in jobs:
+                job_text = f"{getattr(job, 'job_id', '')} {getattr(job, 'name', '')}".lower()
+                if any(token in job_text for token in ("deploy", "release", "publish", "prod", "build", "test")):
+                    score += 1
+                    break
+
+        if getattr(pipeline, "critical_steps", []):
+            score += 1
+        return score
+
     def _validate_scanner_signals(self, issues: list[ValidationIssue], fact_model: FactModel) -> None:
         if fact_model.confidence_overall < 0.25:
             self._append_issue(
@@ -508,6 +831,38 @@ class ValidatorEngine:
 
     def _h2_count(self, content: str) -> int:
         return sum(1 for line in content.splitlines() if line.strip().startswith("## "))
+
+    def _h2_titles(self, content: str) -> list[str]:
+        titles: list[str] = []
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                titles.append(stripped[3:].strip())
+        return titles
+
+    def _validate_parity_sections(
+        self,
+        issues: list[ValidationIssue],
+        artifact_name: str,
+        content: str,
+    ) -> None:
+        expected_titles = self._PARITY_SECTION_TITLES.get(artifact_name, [])
+        if not expected_titles:
+            return
+        existing_titles = set(self._h2_titles(content))
+        artifact_slug = self._PARITY_ARTIFACT_SLUG.get(artifact_name, artifact_name.lower().replace(".md", ""))
+        severity = self._PARITY_SECTION_SEVERITY.get(artifact_name, Severity.MAJOR)
+        for index, title in enumerate(expected_titles, start=1):
+            if title in existing_titles:
+                continue
+            self._append_issue(
+                issues=issues,
+                issue_id=f"parity_section_missing_{artifact_slug}_{index:02d}",
+                severity=severity,
+                artifact=artifact_name,
+                description=f"Missing required parity section title: ## {title}",
+                remediation="Regenerate artifact and restore all mandatory parity section titles.",
+            )
 
     def _quality_score(self, issues: list[ValidationIssue]) -> float:
         penalties = {

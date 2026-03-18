@@ -11,9 +11,11 @@ env/
 
 # Local runtime artifacts
 .monitor/
+.monitor_sessions_test/
 out/
 pilot_runs/
 pilot_workspace/
+repos_lab/
 
 # IDE / OS files
 .vscode/
